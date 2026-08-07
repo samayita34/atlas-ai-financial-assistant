@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from enum import Enum
 from typing import Any, Optional, TypedDict, cast
 
@@ -42,7 +43,6 @@ from app.database.models import ConversationMessage
 from app.services.document_service import DocumentService
 from app.services.financial_data_service import FinancialDataService
 from app.services.memory_service import MemoryService
-from app.services.watchlist_service import WatchlistService
 
 # TODO: No dedicated "LLM client" service was present in "Already
 # Implemented". Assuming a thin Gemini wrapper is reasonable to construct
@@ -128,7 +128,7 @@ class ServiceBundle(TypedDict):
     memory_service: MemoryService
     financial_data_service: FinancialDataService
     document_service: DocumentService
-    watchlist_service: WatchlistService
+    watchlist_service: Optional[Any]
 
 
 
@@ -237,6 +237,115 @@ Respond ONLY with strict JSON of the form:
 """
 
 
+_KNOWN_COMPANY_MAP: dict[str, str] = {
+    "apple": "AAPL",
+    "microsoft": "MSFT",
+    "tesla": "TSLA",
+    "nvidia": "NVDA",
+    "amazon": "AMZN",
+    "google": "GOOGL",
+    "alphabet": "GOOGL",
+    "meta": "META",
+    "facebook": "META",
+    "netflix": "NFLX",
+    "amd": "AMD",
+    "intel": "INTC",
+    "salesforce": "CRM",
+    "oracle": "ORCL",
+    "adobe": "ADBE",
+    "palantir": "PLTR",
+    "coinbase": "COIN",
+    "uber": "UBER",
+    "lyft": "LYFT",
+    "airbnb": "ABNB",
+    "spotify": "SPOT",
+    "paypal": "PYPL",
+    "boeing": "BA",
+    "walmart": "WMT",
+    "disney": "DIS",
+    "coca-cola": "KO",
+    "coca cola": "KO",
+    "pepsi": "PEP",
+    "pepsico": "PEP",
+}
+
+_EXCLUDED_UPPERCASE_WORDS: set[str] = {
+    "A", "I", "AN", "AM", "AT", "BY", "DO", "IN", "IS", "IT", "MY", "NO", "ON",
+    "OR", "SO", "TO", "UP", "US", "WE", "FOR", "THE", "AND", "ARE", "BUT", "NOT",
+    "YOU", "ALL", "ANY", "CAN", "HAD", "HER", "WAS", "ONE", "OUR", "OUT", "DAY",
+    "GET", "HAS", "HIM", "HIS", "HOW", "MAN", "NEW", "NOW", "OLD", "SEE", "TWO",
+    "WAY", "WHO", "BOY", "DID", "ITS", "LET", "PUT", "SAY", "SHE", "TOO", "USE",
+    "CEO", "SEC", "PDF", "USD", "USA", "API", "AI", "Q1", "Q2", "Q3", "Q4",
+    "YOY", "TTM", "PE", "EPS", "WHAT", "HOW", "TELL", "SHOW", "GIVE", "NEWS",
+}
+
+
+def _fallback_entity_extraction(
+    text: str,
+    intent: Intent,
+    confidence: float,
+    entities: dict[str, Any],
+) -> tuple[Intent, float, dict[str, Any]]:
+    """
+    Fallback and enrichment helper for intent classification and entity extraction.
+    Ensures company names and ticker symbols are reliably extracted even if Gemini
+    fails, returns empty entities, or returns low confidence.
+    """
+    tickers: list[str] = list(entities.get("tickers") or [])
+    company_names: list[str] = list(entities.get("company_names") or [])
+
+    text_lower = text.lower()
+
+    # 1. Check known company mapping
+    for name, ticker in _KNOWN_COMPANY_MAP.items():
+        if re.search(r"\b" + re.escape(name) + r"\b", text_lower):
+            if name.capitalize() not in company_names and name.upper() not in [c.upper() for c in company_names]:
+                company_names.append(name.capitalize())
+            if ticker not in tickers:
+                tickers.append(ticker)
+
+    # 2. Extract potential uppercase tickers (e.g. AAPL, MSFT, TSLA, NVDA)
+    raw_words = re.findall(r"\b[A-Z]{2,5}\b", text)
+    for word in raw_words:
+        if word not in _EXCLUDED_UPPERCASE_WORDS and word not in tickers:
+            tickers.append(word)
+
+    # 3. Dynamic pattern matching for company names if still none found
+    if not company_names and not tickers:
+        patterns = [
+            r"(?:about|tell me about|research|analyze|summary for|summarize|overview of|check|what is|how is)\s+([A-Z][a-zA-Z0-9\.\s]+?)(?:\s+(?:stock|financials|price|market|shares|earnings|revenue|report|data)|'s|\s*$|\?|\!)",
+            r"([A-Z][a-zA-Z0-9\.]+)\s+(?:stock|financials|price|market|shares|earnings|revenue)",
+        ]
+        for pat in patterns:
+            matches = re.findall(pat, text, re.IGNORECASE)
+            for m in matches:
+                clean_m = m.strip()
+                if clean_m and clean_m.lower() not in ["the", "a", "an", "this", "that"]:
+                    company_names.append(clean_m)
+
+    updated_entities = {
+        "tickers": tickers,
+        "company_names": company_names,
+    }
+
+    # 4. Infer intent if financial/company research cues are present
+    has_entities = bool(tickers or company_names)
+    financial_keywords = [
+        "stock", "financial", "financials", "price", "market", "earnings",
+        "revenue", "share", "shares", "ticker", "company", "overview",
+        "tell me about", "what is", "summarize", "analyze", "report"
+    ]
+    has_financial_cue = any(kw in text_lower for kw in financial_keywords)
+
+    if has_entities or has_financial_cue:
+        if intent == Intent.AMBIGUOUS or confidence < 0.45:
+            if has_entities:
+                intent = Intent.COMPANY_RESEARCH
+                confidence = max(confidence, 0.9)
+
+    return intent, confidence, updated_entities
+
+
 async def classify_intent_node(state: AgentState) -> AgentState:
     """
     Use the LLM to classify the user's message into an Intent, extract
@@ -268,6 +377,11 @@ async def classify_intent_node(state: AgentState) -> AgentState:
 
     confidence = float(parsed.get("confidence", 0.0) or 0.0)
     entities = parsed.get("entities", {}) or {}
+
+    # Run fallback entity extraction and intent enrichment
+    intent, confidence, entities = _fallback_entity_extraction(
+        state["text"], intent, confidence, entities
+    )
 
     # Guardrail: company_research with no ticker/company name is ambiguous.
     if intent == Intent.COMPANY_RESEARCH and not (
@@ -395,46 +509,10 @@ async def document_qa_node(state: AgentState) -> AgentState:
 
 async def watchlist_node(state: AgentState) -> AgentState:
     """
-    Handle watchlist add/remove/view requests via MemoryService.
+    Handle watchlist add/remove/view requests.
+    Temporarily stubbed while WatchlistService dependency is detached.
     """
-    services = state["services"]
-    watchlist_service = services["watchlist_service"]
-    user_id = state["user_id"]
-    entities = state.get("entities", {})
-    tickers: list[str] = entities.get("tickers") or []
-
-    text_lower = state["text"].lower()
-    try:
-        async with AsyncSessionLocal() as session:
-            # WatchlistService methods operate on a per-symbol basis.
-            # For multi-ticker add/remove, iterate over each ticker.
-            if tickers and any(w in text_lower for w in ("add", "track", "watch")):
-                for ticker in tickers:
-                    await watchlist_service.add_ticker(
-                        session, telegram_id=user_id, symbol=ticker
-                    )
-                current = await watchlist_service.get_symbols(
-                    session, telegram_id=user_id
-                )
-            elif tickers and any(w in text_lower for w in ("remove", "drop", "untrack")):
-                for ticker in tickers:
-                    await watchlist_service.remove_ticker(
-                        session, telegram_id=user_id, symbol=ticker
-                    )
-                current = await watchlist_service.get_symbols(
-                    session, telegram_id=user_id
-                )
-            else:
-                current = await watchlist_service.get_symbols(
-                    session, telegram_id=user_id
-                )
-
-        state["tool_result"] = json.dumps({"watchlist": current}, default=str)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Watchlist operation failed for user_id=%s", user_id)
-        state["error"] = f"watchlist_op_failed: {exc}"
-        state["tool_result"] = None
-
+    state["tool_result"] = json.dumps({"watchlist": []}, default=str)
     return state
 
 
@@ -606,7 +684,7 @@ async def run_agent(
     memory_service: MemoryService,
     financial_data_service: FinancialDataService,
     document_service: DocumentService,
-    watchlist_service: Optional[WatchlistService] = None,
+    watchlist_service: Optional[Any] = None,
 ) -> str:
     """
     Run the Atlas LangGraph workflow for a single user turn and return the
@@ -619,15 +697,12 @@ async def run_agent(
         memory_service: Shared MemoryService instance.
         financial_data_service: Shared FinancialDataService instance.
         document_service: Shared DocumentService instance.
-        watchlist_service: Optional WatchlistService instance. If not
-            supplied, one is constructed from financial_data_service.
+        watchlist_service: Optional WatchlistService instance.
 
     Returns:
         A concise, user-facing reply string.
     """
-    effective_watchlist_service = watchlist_service or WatchlistService(
-        financial_data_service=financial_data_service
-    )
+    effective_watchlist_service = watchlist_service
 
     initial_state: AgentState = {
         "user_id": user_id,

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.config import Environment, get_settings
+from app.database.models import Base
 
 logger = logging.getLogger(__name__)
 
@@ -72,19 +73,20 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_db() -> None:
     """
-    Verify database connectivity during application startup.
+    Verify database connectivity and create schema during application startup.
     """
 
     logger.info("Initializing database connection...")
 
     try:
-        async with engine.connect() as conn:
+        async with engine.begin() as conn:
             await conn.execute(text("SELECT 1"))
+            await conn.run_sync(Base.metadata.create_all)
 
-        logger.info("Database connection established successfully.")
+        logger.info("Database connection and schema initialized successfully.")
 
     except Exception:
-        logger.exception("Failed to establish database connection.")
+        logger.exception("Failed to establish database connection or initialize schema.")
         raise
 
 

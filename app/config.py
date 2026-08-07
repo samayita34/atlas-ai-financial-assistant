@@ -121,9 +121,9 @@ class Settings(BaseSettings):
         default="text-embedding-004",
         description="Embedding model id used by rag/embeddings.py for document and query embeddings.",
     )
-    transcription_api_key: SecretStr = Field(
-        ...,
-        description="API key for the speech-to-text provider used by tools/transcription.py (e.g. OpenAI Whisper).",
+    transcription_api_key: SecretStr | None = Field(
+        default=None,
+        description="Optional API key for an external speech-to-text provider (e.g. OpenAI Whisper).",
     )
 
     # ------------------------------------------------------------------

@@ -15,6 +15,7 @@ import logging
 from typing import BinaryIO, Optional
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BufferedInputFile, Message
@@ -45,7 +46,12 @@ def create_bot() -> Bot:
     """
     settings = get_settings()
     token = settings.telegram_bot_token.get_secret_value()
-    return Bot(token=token, parse_mode=ParseMode.MARKDOWN)
+    return Bot(
+        token=token,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.MARKDOWN,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

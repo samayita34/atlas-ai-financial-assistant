@@ -245,7 +245,9 @@ class SpeechService:
                     ),
                     timeout=self._timeout_seconds,
                 )
-                return (response.text or "").strip()
+                if response is not None and response.text:
+                    return response.text.strip()
+                return ""
             except asyncio.TimeoutError as exc:
                 last_exc = exc
                 if attempt <= MAX_RETRIES:

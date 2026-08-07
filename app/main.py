@@ -35,6 +35,7 @@ from app.config import get_settings
 
 settings = get_settings()
 from app.database.database import (
+    AsyncSessionLocal,
     close_db,
     init_db,
 )
@@ -116,9 +117,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # (e.g. reading API keys, DB session factory, etc. internally). Adjust
     # if they require explicit dependencies (session factory, http
     # client, embedding model, etc.) to be passed in.
-    memory_service = MemoryService()
+    session = AsyncSessionLocal()
+    memory_service = MemoryService(session)
     financial_data_service = FinancialDataService()
-    document_service = DocumentService()
+    document_service = DocumentService(session)
 
     app_state.memory_service = memory_service
     app_state.financial_data_service = financial_data_service
@@ -167,13 +169,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             except Exception:  # noqa: BLE001
                 logger.exception("Error while closing Telegram bot session.")
 
-        # ---- Dispose database engine ----------------------------------
         try:
-            # TODO: `dispose_engine` is assumed to be an async callable
-            # that calls `engine.dispose()` on the shared SQLAlchemy
-            # async engine defined in `database.py`. Adjust name/signature
-            # if the real module exposes something else (e.g. a module
-            # level `engine.dispose()` call, or no explicit disposal API).
+            await session.close()
             await close_db()
             logger.info("Database engine disposed.")
         except Exception:  # noqa: BLE001

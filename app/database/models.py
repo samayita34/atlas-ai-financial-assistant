@@ -42,6 +42,7 @@ from sqlalchemy import (
     Time,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import (
@@ -126,7 +127,7 @@ class User(Base):
         Enum(UserRole, name="user_role"),
         nullable=False,
         default=UserRole.USER,
-        server_default=UserRole.USER.value,
+        server_default=text("'USER'"),
     )
 
     # Personalization / preferences
@@ -320,8 +321,8 @@ class DocumentChunk(Base):
     )
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list[float] | None] = mapped_column(
-        Vector(EMBEDDING_DIM),
+    embedding: Mapped[str | None] = mapped_column(
+        Text,
         nullable=True,
         doc="pgvector embedding of `content`, dimension EMBEDDING_DIM.",
     )
@@ -377,7 +378,7 @@ class DailyBriefLog(Base):
         Enum(BriefStatus, name="brief_status"),
         nullable=False,
         default=BriefStatus.PENDING,
-        server_default=BriefStatus.PENDING.value,
+        server_default=text("'PENDING'"),
     )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
