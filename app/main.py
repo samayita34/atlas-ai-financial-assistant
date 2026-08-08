@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+from typing import AsyncGenerator, Optional
 
 from aiogram import Bot, Dispatcher
 from fastapi import FastAPI
@@ -81,7 +81,7 @@ async def _start_bot_polling(bot: Bot, dispatcher: Dispatcher) -> None:
     `telegram_bot.run_polling`.
     """
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.delete_webhook(drop_pending_updates=False)
         await dispatcher.start_polling(bot, handle_signals=False)
     except asyncio.CancelledError:
         logger.info("Telegram polling task cancelled; shutting down cleanly.")
@@ -92,7 +92,7 @@ async def _start_bot_polling(bot: Bot, dispatcher: Dispatcher) -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     FastAPI lifespan handler: manages startup and shutdown of the
     database, service layer, and Telegram bot.
@@ -149,7 +149,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # ---- Stop Telegram polling ----------------------------------
         if app_state.dispatcher is not None:
             try:
-                app_state.dispatcher.stop_polling()
+                await app_state.dispatcher.stop_polling()
             except Exception:  # noqa: BLE001
                 logger.exception("Error while stopping dispatcher polling.")
 
@@ -199,7 +199,7 @@ async def health_check() -> JSONResponse:
     signal of overall service health. Extend with a DB ping if a
     dedicated health-check query is added to `database.py`.
     """
-    polling_alive = bool(
+    polling_alive = (
         app_state.polling_task is not None and not app_state.polling_task.done()
     )
     status = "ok" if polling_alive else "degraded"

@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import traceback
 from enum import Enum
 from typing import Any, Optional, TypedDict, cast
 
@@ -49,9 +50,15 @@ from app.services.memory_service import MemoryService
 # directly here via google-genai, configured from app.config.settings.
 # Adjust this import if a shared `app/services/llm_service.py` (or similar)
 # already exists in the real codebase.
-from app.config import get_settings
+from app.config import Environment, get_settings
 
 settings = get_settings()
+
+
+def _is_dev_environment() -> bool:
+    """Return True when running locally so developer-friendly error details
+    are surfaced in Telegram instead of being swallowed by a generic message."""
+    return settings.environment == Environment.LOCAL
 
 try:
     from google import genai  # type: ignore[import-not-found]
@@ -73,6 +80,10 @@ GEMINI_MODEL_NAME: str = settings.gemini_model
 
 MAX_RESPONSE_CHARS: int = 1200  # keep replies concise for Telegram
 CONVERSATION_HISTORY_LIMIT: int = 10  # number of prior turns to load for context
+
+# Sentinel prefix that telegram_bot.py detects to send the message as plain
+# text (no ParseMode), preventing Markdown parse failures on raw tracebacks.
+_DEV_ERROR_PREFIX = "[DEV-ERROR]"
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +161,7 @@ async def _call_gemini(
     in the codebase (if a shared llm client already exists, replace this
     helper with a call into it instead of instantiating genai here).
     """
-    if _genai_client is None:  # pragma: no cover - defensive fallback
+    if _genai_client is None or genai_types is None:  # pragma: no cover - defensive fallback
         logger.error("Gemini client is not configured; returning empty response")
         return ""
 
@@ -575,17 +586,39 @@ async def compose_response_node(state: AgentState) -> AgentState:
 
     try:
         reply = await _call_gemini(prompt, system_instruction=_RESPONSE_SYSTEM_PROMPT)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        tb = traceback.format_exc()
         logger.exception("Failed to compose final response")
-        reply = ""
+        if _is_dev_environment():
+            # Plain text — NO Markdown. Telegram rejects messages whose
+            # ParseMode=Markdown clashes with raw traceback characters
+            # (* _ ` etc.), causing a silent send failure (no reply at all).
+            reply = (
+                f"{_DEV_ERROR_PREFIX}\n"
+                f"[DEV] compose_response_node raised {type(exc).__name__}\n"
+                f"{exc}\n\n"
+                f"--- traceback (last 1500 chars) ---\n{tb[-1500:]}"
+            )
+        else:
+            reply = ""
 
     if not reply:
-        reply = (
-            "I ran into an issue putting that together. Could you try "
-            "rephrasing or asking again in a moment?"
-        )
+        if _is_dev_environment():
+            # Gemini returned empty text with no exception — surface clearly.
+            reply = (
+                f"{_DEV_ERROR_PREFIX}\n"
+                "[DEV] Gemini returned an empty response from compose_response_node.\n"
+                f"Model: {GEMINI_MODEL_NAME} | Check API key, quota, and prompt."
+            )
+        else:
+            reply = (
+                "I ran into an issue putting that together. Could you try "
+                "rephrasing or asking again in a moment?"
+            )
 
-    if len(reply) > MAX_RESPONSE_CHARS:
+    # Skip the character cap for dev error payloads so the full traceback
+    # is always visible during debugging.
+    if not reply.startswith(_DEV_ERROR_PREFIX) and len(reply) > MAX_RESPONSE_CHARS:
         reply = reply[: MAX_RESPONSE_CHARS - 3].rstrip() + "..."
 
     state["response"] = reply
@@ -724,13 +757,36 @@ async def run_agent(
 
     try:
         final_state: AgentState = cast(AgentState, await _compiled_graph.ainvoke(initial_state))
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        tb = traceback.format_exc()
         logger.exception("LangGraph execution failed for user_id=%s", user_id)
+        if _is_dev_environment():
+            return (
+                f"{_DEV_ERROR_PREFIX}\n"
+                f"[DEV] LangGraph ainvoke raised {type(exc).__name__}\n"
+                f"{exc}\n\n"
+                f"--- traceback (last 1500 chars) ---\n{tb[-1500:]}"
+            )
         return (
             "I hit an unexpected error processing that request. Please "
             "try again shortly."
         )
 
-    return final_state.get("response") or (
-        "I couldn't quite process that — could you rephrase your request?"
+    response = final_state.get("response")
+    if response:
+        return response
+
+    # No response was produced — surface the internal error state if available.
+    internal_error = final_state.get("error")
+    logger.error(
+        "run_agent produced no response for user_id=%s; internal error state: %s",
+        user_id,
+        internal_error,
     )
+    if _is_dev_environment() and internal_error:
+        return (
+            f"{_DEV_ERROR_PREFIX}\n"
+            f"[DEV] Agent returned no response.\n"
+            f"Internal error state: {internal_error}"
+        )
+    return "I couldn't quite process that — could you rephrase your request?"

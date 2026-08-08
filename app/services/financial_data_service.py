@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Final, Optional
 
 import httpx
@@ -44,11 +44,12 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-# TODO: Confirm attribute names on `settings`. Assuming `finnhub_api_key`
-# is defined in app/config.py per the project's Finnhub integration.
-FINNHUB_API_KEY: Final[str] = getattr(settings, "finnhub_api_key", "")
+FINNHUB_API_KEY: Final[str] = settings.finnhub_api_key.get_secret_value()
+
 FINNHUB_BASE_URL: Final[str] = getattr(
-    settings, "finnhub_base_url", "https://finnhub.io/api/v1"
+    settings,
+    "finnhub_base_url",
+    "https://finnhub.io/api/v1",
 )
 
 DEFAULT_TIMEOUT_SECONDS: Final[float] = 10.0
@@ -236,10 +237,10 @@ class CompanyOverview:
         """Serialize to a plain dict, suitable for JSON/LLM prompting."""
         return {
             "symbol": self.symbol,
-            "profile": self.profile.__dict__ if self.profile else None,
-            "quote": self.quote.__dict__ if self.quote else None,
+            "profile": asdict(self.profile) if self.profile else None,
+            "quote": asdict(self.quote) if self.quote else None,
             "metrics": (
-                {k: v for k, v in self.metrics.__dict__.items() if k != "raw"}
+                {k: v for k, v in asdict(self.metrics).items() if k != "raw"}
                 if self.metrics
                 else None
             ),
@@ -252,7 +253,7 @@ class CompanyOverview:
                     "datetime": item.datetime_unix,
                 }
                 for item in self.news
-            ],
+            ] if self.news else [],
         }
 
 
@@ -302,23 +303,22 @@ class FinancialDataService:
     def __init__(
         self,
         *,
-        api_key: str = FINNHUB_API_KEY,
+        api_key: Optional[str] = None,
         base_url: str = FINNHUB_BASE_URL,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         """
         Args:
-            api_key: Finnhub API key. TODO: sourced from
-                `settings.finnhub_api_key`; raises `FinnhubConfigError` at
-                call time if empty.
+            api_key: Optional Finnhub API key. Sourced from
+                `FINNHUB_API_KEY` if not supplied.
             base_url: Finnhub REST API base URL.
             timeout_seconds: Per-request timeout.
             client: Optional pre-configured `httpx.AsyncClient` (useful
                 for testing/dependency injection). If omitted, one is
                 created lazily on first use.
         """
-        self._api_key = api_key
+        self._api_key = api_key if api_key is not None else FINNHUB_API_KEY
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._client: Optional[httpx.AsyncClient] = client

@@ -183,7 +183,7 @@ async def _get_all_briefing_targets(memory_service: MemoryService) -> list[UserB
             if telegram_id is None:
                 continue
 
-            watchlist = getattr(user, "watchlist", None)
+            watchlist = getattr(user, "watchlist", None) or getattr(user, "followed_companies", None)
             if watchlist is None:
                 try:
                     watchlist = await memory_service.get_watchlist(
@@ -195,10 +195,11 @@ async def _get_all_briefing_targets(memory_service: MemoryService) -> list[UserB
                     )
                     watchlist = []
 
+            first_name = getattr(user, "first_name", None) or getattr(user, "full_name", None)
             targets.append(
                 UserBriefingTarget(
                     telegram_id=telegram_id,
-                    first_name=getattr(user, "first_name", None),
+                    first_name=first_name,
                     watchlist=list(watchlist or []),
                 )
             )

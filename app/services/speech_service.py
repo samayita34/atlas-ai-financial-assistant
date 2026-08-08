@@ -28,7 +28,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Optional, Union
+from typing import Any, Final, Optional, Union
 
 from app.config import get_settings
 
@@ -139,7 +139,7 @@ class SpeechService:
         model_name: str = GEMINI_TRANSCRIPTION_MODEL_NAME,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_audio_size_bytes: int = MAX_AUDIO_SIZE_BYTES,
-        client: Optional["genai.Client"] = None,
+        client: Optional[Any] = None,
     ) -> None:
         """
         Args:
@@ -163,7 +163,7 @@ class SpeechService:
 
     # -- client lifecycle ------------------------------------------------
 
-    def _get_client(self) -> "genai.Client":
+    def _get_client(self) -> Any:
         if genai is None:
             raise SpeechServiceConfigError(
                 "google-genai SDK is not installed; cannot transcribe audio."
@@ -188,7 +188,9 @@ class SpeechService:
             SpeechServiceError: if a path is given and the file cannot be
                 read.
         """
-        if isinstance(source, (bytes, bytearray)):
+        if isinstance(source, bytes):
+            return source
+        if isinstance(source, bytearray):
             return bytes(source)
 
         path = Path(source)
@@ -232,6 +234,11 @@ class SpeechService:
             TranscriptionRequestError: on failure after exhausting retries.
         """
         client = self._get_client()
+
+        if genai_types is None:
+            raise SpeechServiceConfigError(
+                "google-genai SDK is not installed; cannot transcribe audio."
+            )
 
         audio_part = genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
 

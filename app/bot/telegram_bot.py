@@ -12,18 +12,20 @@ from __future__ import annotations
 
 import io
 import logging
+import traceback
 from typing import BinaryIO, Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BufferedInputFile, Message
 
-from app.config import get_settings
+from app.config import Environment, get_settings
 from app.database.database import AsyncSessionLocal
 from app.database.models import MessageRole, User
-from app.langgraph.graph import run_agent
+from app.langgraph.graph import _DEV_ERROR_PREFIX, run_agent
 from app.services.document_service import DocumentIngestionError, DocumentService
 from app.services.financial_data_service import FinancialDataService
 from app.services.memory_service import MemoryService
@@ -270,18 +272,39 @@ async def _process_user_query(
         )
 
     # Instantiate default services if global references were not supplied via setup_bot
-    async with AsyncSessionLocal() as session:
-        mem_svc = _memory_service or MemoryService(session)
-        doc_svc = _document_service or DocumentService(session)
-        fin_svc = _financial_data_service or FinancialDataService()
+    try:
+        async with AsyncSessionLocal() as session:
+            mem_svc = _memory_service or MemoryService(session)
+            doc_svc = _document_service or DocumentService(session)
+            fin_svc = _financial_data_service or FinancialDataService()
 
-        response_text = await run_agent(
-            user_id=user.telegram_id,
-            text=text,
-            memory_service=mem_svc,
-            financial_data_service=fin_svc,
-            document_service=doc_svc,
+            response_text = await run_agent(
+                user_id=user.telegram_id,
+                text=text,
+                memory_service=mem_svc,
+                financial_data_service=fin_svc,
+                document_service=doc_svc,
+            )
+    except Exception as exc:  # noqa: BLE001
+        tb = traceback.format_exc()
+        logger.exception(
+            "run_agent raised an unexpected exception for user_id=%s", user.telegram_id
         )
+        settings = get_settings()
+        if settings.environment == Environment.LOCAL:
+            # Plain text with sentinel — telegram_bot sends this without ParseMode
+            # so Telegram never rejects it due to Markdown-special chars in tracebacks.
+            response_text = (
+                f"{_DEV_ERROR_PREFIX}\n"
+                f"[DEV] run_agent raised {type(exc).__name__}\n"
+                f"{exc}\n\n"
+                f"--- traceback (last 1500 chars) ---\n{tb[-1500:]}"
+            )
+        else:
+            response_text = (
+                "I ran into an issue putting that together. "
+                "Could you try rephrasing or asking again in a moment?"
+            )
 
     async with AsyncSessionLocal() as session:
         memory = MemoryService(session)
@@ -291,10 +314,40 @@ async def _process_user_query(
             content=response_text,
         )
 
+    # Dev error messages are plain text (no Markdown) so Telegram doesn't
+    # reject them when the traceback contains Markdown-special characters.
+    # Use an explicit parse_mode= argument (not **kwargs) so the type checker
+    # can resolve the exact type instead of spreading str|None over every param.
+    effective_parse_mode: Optional[str] = (
+        None if response_text.startswith(_DEV_ERROR_PREFIX) else ParseMode.MARKDOWN
+    )
+
     if status_msg:
-        await status_msg.edit_text(response_text)
+        try:
+            await status_msg.edit_text(response_text, parse_mode=effective_parse_mode)
+        except TelegramBadRequest as exc:
+            if "can't parse entities" in str(exc).lower():
+                logger.warning(
+                    "Telegram rejected Markdown entities in response for user_id=%s; resending as plain text. error=%s",
+                    user.telegram_id,
+                    exc,
+                )
+                await status_msg.edit_text(response_text, parse_mode=None)
+            else:
+                raise
     else:
-        await message.answer(response_text)
+        try:
+            await message.answer(response_text, parse_mode=effective_parse_mode)
+        except TelegramBadRequest as exc:
+            if "can't parse entities" in str(exc).lower():
+                logger.warning(
+                    "Telegram rejected Markdown entities in response for user_id=%s; resending as plain text. error=%s",
+                    user.telegram_id,
+                    exc,
+                )
+                await message.answer(response_text, parse_mode=None)
+            else:
+                raise
 
 
 # ---------------------------------------------------------------------------

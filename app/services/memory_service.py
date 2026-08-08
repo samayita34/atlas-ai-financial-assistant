@@ -74,6 +74,50 @@ class MemoryService:
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def list_all_users(self, session: AsyncSession | None = None) -> list[User]:
+        """
+        Retrieve all users in the system.
+
+        Args:
+            session: Optional `AsyncSession` override. If not provided,
+                uses the session bound to this `MemoryService` instance.
+
+        Returns:
+            A list of all `User` records.
+        """
+        sess = session or self._session
+        stmt = select(User)
+        result = await sess.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_watchlist(
+        self,
+        session: AsyncSession | None = None,
+        telegram_id: int | None = None,
+    ) -> list[str]:
+        """
+        Retrieve the list of watchlist ticker symbols followed by a user.
+
+        Args:
+            session: Optional `AsyncSession` override. If not provided,
+                uses the session bound to this `MemoryService` instance.
+            telegram_id: Telegram user ID.
+
+        Returns:
+            List of ticker symbol strings followed by the user.
+        """
+        if telegram_id is None:
+            return []
+        sess = session or self._session
+        user = await self.get_user_by_telegram_id(telegram_id) if sess is self._session else (
+            (await sess.execute(select(User).where(User.telegram_id == telegram_id))).scalar_one_or_none()
+        )
+        if user is None or not user.followed_companies:
+            return []
+        if isinstance(user.followed_companies, list):
+            return [str(ticker) for ticker in user.followed_companies]
+        return []
+
     async def get_or_create_user(
         self,
         telegram_id: int,

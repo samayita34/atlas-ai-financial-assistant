@@ -114,7 +114,7 @@ class Settings(BaseSettings):
         description="Google AI Studio API key used for all Gemini calls in agent/.",
     )
     gemini_model: str = Field(
-        default="gemini-2.0-flash",
+        default="gemini-3.1-flash-lite",
         description="Gemini model id used for agent reasoning and generation.",
     )
     embedding_model: str = Field(
