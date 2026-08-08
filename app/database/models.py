@@ -400,3 +400,37 @@ class DailyBriefLog(Base):
             f"<DailyBriefLog id={self.id} user_id={self.user_id} "
             f"brief_date={self.brief_date} status={self.status}>"
         )
+
+
+# ---------------------------------------------------------------------------
+# WatchlistItem
+# ---------------------------------------------------------------------------
+class WatchlistItem(Base):
+    """
+    A single stock/company ticker followed on a user's watchlist.
+    """
+
+    __tablename__ = "watchlist_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        primary_key=True, default=uuid.uuid4
+    )
+    telegram_id: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, index=True
+    )
+    symbol: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    company_name: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("telegram_id", "symbol", name="uq_watchlist_user_symbol"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<WatchlistItem id={self.id} telegram_id={self.telegram_id} symbol={self.symbol}>"

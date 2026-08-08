@@ -30,6 +30,7 @@ from app.services.document_service import DocumentIngestionError, DocumentServic
 from app.services.financial_data_service import FinancialDataService
 from app.services.memory_service import MemoryService
 from app.services.speech_service import SpeechService
+from app.services.watchlist_service import WatchlistService
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ _memory_service: Optional[MemoryService] = None
 _financial_data_service: Optional[FinancialDataService] = None
 _document_service: Optional[DocumentService] = None
 _speech_service: Optional[SpeechService] = None
+_watchlist_service: Optional[WatchlistService] = None
 
 
 def create_bot() -> Bot:
@@ -277,6 +279,7 @@ async def _process_user_query(
             mem_svc = _memory_service or MemoryService(session)
             doc_svc = _document_service or DocumentService(session)
             fin_svc = _financial_data_service or FinancialDataService()
+            wl_svc = _watchlist_service or WatchlistService(financial_data_service=fin_svc)
 
             response_text = await run_agent(
                 user_id=user.telegram_id,
@@ -284,6 +287,7 @@ async def _process_user_query(
                 memory_service=mem_svc,
                 financial_data_service=fin_svc,
                 document_service=doc_svc,
+                watchlist_service=wl_svc,
             )
     except Exception as exc:  # noqa: BLE001
         tb = traceback.format_exc()
@@ -359,12 +363,13 @@ def setup_bot(
     financial_data_service: Optional[FinancialDataService] = None,
     document_service: Optional[DocumentService] = None,
     speech_service: Optional[SpeechService] = None,
+    watchlist_service: Optional[WatchlistService] = None,
     bot: Optional[Bot] = None,
 ) -> tuple[Bot, Dispatcher]:
     """
     Initialize and wire up the Bot and Dispatcher with router handlers.
     """
-    global _memory_service, _financial_data_service, _document_service, _speech_service
+    global _memory_service, _financial_data_service, _document_service, _speech_service, _watchlist_service
 
     if memory_service is not None:
         _memory_service = memory_service
@@ -374,6 +379,8 @@ def setup_bot(
         _document_service = document_service
     if speech_service is not None:
         _speech_service = speech_service
+    if watchlist_service is not None:
+        _watchlist_service = watchlist_service
 
     active_bot = bot or create_bot()
     dp = Dispatcher()

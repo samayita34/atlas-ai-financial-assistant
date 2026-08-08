@@ -1,28 +1,3 @@
-"""
-app/services/memory_service.py
-
-Memory service: owns all long-term user memory.
-
-This service is the single place responsible for reading and writing
-`User` and `ConversationMessage` state. It encapsulates:
-    - User creation/lookup by Telegram ID.
-    - Onboarding state updates.
-    - Conversation history storage and retrieval.
-    - Personalization field updates (followed companies/sectors, insight
-      preferences, notes, onboarding_completed).
-
-Design notes:
-    - This module contains ONLY business logic. It knows nothing about
-      FastAPI routes or Telegram handlers — callers (API routes, bot
-      handlers, schedulers, etc.) are expected to obtain an `AsyncSession`
-      (e.g. via `app.database.database.get_db`) and pass it in.
-    - Per the project's session-handling convention, this service is
-      responsible for committing its own units of work. The session
-      dependency itself does not auto-commit.
-    - Methods that mutate state flush (and commit) so callers get back
-      fully persisted, ID-populated objects.
-"""
-
 from __future__ import annotations
 
 from typing import Any

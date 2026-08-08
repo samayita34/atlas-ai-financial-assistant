@@ -1,32 +1,3 @@
-"""
-app/services/watchlist_service.py
-
-Watchlist management service for Atlas AI Financial Assistant.
-
-Handles adding, removing, and listing tickers on a user's watchlist,
-backed by PostgreSQL via async SQLAlchemy. Ticker validity is confirmed
-against Finnhub (through `FinancialDataService`) before persisting, so
-users can't add junk symbols to their watchlist.
-
-Designed to be used both directly (e.g. from `app/langgraph/graph.py`'s
-watchlist node) and as the eventual home for the watchlist persistence
-logic currently assumed to live on `MemoryService` in that module and in
-`app/scheduler.py`.
-
-NOTE ON ASSUMPTIONS:
-- `app.database.models` is assumed to define a `WatchlistItem` model
-  (or equivalent) with at least: `id`, a user-identifying column, a
-  `symbol` column, and a `created_at` timestamp, plus a unique
-  constraint on (user, symbol) to prevent duplicates at the DB level.
-  Since the exact model name/columns weren't provided, this module
-  defines its own minimal expectations and marks them with TODOs so they
-  can be reconciled against the real `models.py`.
-- User identification is assumed to be the Telegram user id (`telegram_id:
-  int`), consistent with `MemoryService`'s assumed interface used
-  elsewhere in the project (`telegram_bot.py`, `langgraph/graph.py`,
-  `scheduler.py`).
-"""
-
 from __future__ import annotations
 
 import logging

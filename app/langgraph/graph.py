@@ -1,33 +1,3 @@
-"""
-app/langgraph/graph.py
-
-LangGraph workflow definition for Atlas AI Financial Assistant.
-
-This module builds and exposes the core conversational graph that powers
-Atlas. It classifies each incoming user message, routes it to the
-appropriate capability (company research, document Q&A, watchlist/memory
-lookups, or plain conversation), asks a clarifying question when the
-request is ambiguous, and produces a concise final response.
-
-The public entrypoint, `run_agent`, matches the interface already assumed
-by `app/bot/telegram_bot.py`:
-
-    async def run_agent(
-        *,
-        user_id: int,
-        text: str,
-        memory_service: MemoryService,
-        financial_data_service: FinancialDataService,
-        document_service: DocumentService,
-    ) -> str: ...
-
-NOTE ON ASSUMPTIONS:
-The exact method signatures of MemoryService, FinancialDataService, and
-DocumentService are not fully specified in the provided context. Where an
-interface is missing or ambiguous, the smallest reasonable assumption is
-made and marked with a `# TODO:` comment.
-"""
-
 from __future__ import annotations
 
 import json
@@ -44,6 +14,13 @@ from app.database.models import ConversationMessage
 from app.services.document_service import DocumentService
 from app.services.financial_data_service import FinancialDataService
 from app.services.memory_service import MemoryService
+from app.services.watchlist_service import (
+    DuplicateTickerError,
+    InvalidTickerError,
+    TickerNotOnWatchlistError,
+    WatchlistError,
+    WatchlistFullError,
+)
 
 # TODO: No dedicated "LLM client" service was present in "Already
 # Implemented". Assuming a thin Gemini wrapper is reasonable to construct
@@ -193,24 +170,32 @@ async def load_context_node(state: AgentState) -> AgentState:
     generation) have context.
     """
     services = state["services"]
-    user_id = state["user_id"]
+    telegram_id = state["user_id"]
+    history: list[dict[str, str]] = []
+    user_profile = None
 
     try:
         async with AsyncSessionLocal() as session:
             memory_service = MemoryService(session)
-            # get_recent_messages returns list[ConversationMessage]; convert
-            # to the {"role": str, "content": str} dicts the rest of the
-            # graph expects.
-            raw_messages = await memory_service.get_recent_messages(
-                user_id=user_id, limit=CONVERSATION_HISTORY_LIMIT
-            )
-            history: list[dict[str, str]] = [
-                {"role": msg.role.value, "content": msg.content}
-                for msg in raw_messages
-            ]
-            user_profile = await memory_service.get_user_by_telegram_id(user_id)
+
+            # ConversationMessage.user_id is the internal UUID primary key
+            # (User.id), NOT the raw Telegram ID. Resolve the user row
+            # first so get_recent_messages is queried with the correct
+            # identifier type -- passing the Telegram ID directly causes
+            # "operator does not exist: uuid = bigint" at the DB level.
+            user_profile = await memory_service.get_user_by_telegram_id(telegram_id)
+
+            if user_profile is not None:
+                raw_messages = await memory_service.get_recent_messages(
+                    user_id=user_profile.id, limit=CONVERSATION_HISTORY_LIMIT
+                )
+                history = [
+                    {"role": msg.role.value, "content": msg.content}
+                    for msg in raw_messages
+                ]
+            # else: new/unknown user -- no history to load yet, keep history=[]
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to load context for user_id=%s", user_id)
+        logger.exception("Failed to load context for user_id=%s", telegram_id)
         history = []
         user_profile = None
         state["error"] = f"context_load_failed: {exc}"
@@ -348,7 +333,31 @@ def _fallback_entity_extraction(
     ]
     has_financial_cue = any(kw in text_lower for kw in financial_keywords)
 
-    if has_entities or has_financial_cue:
+    # Watchlist phrasing must win over the generic company-research
+    # fallback below -- otherwise "add AAPL to my watchlist" or "remove
+    # AAPL" get silently re-routed to company_research whenever a ticker
+    # is present and Gemini's own confidence was low. Two signals:
+    #   1. An explicit mention of "watchlist" (always a strong signal,
+    #      even with no ticker -- e.g. "show my watchlist").
+    #   2. An unambiguous removal verb ("remove"/"drop"/etc.) combined
+    #      with a ticker -- narrower than "add"/"watch"/"track"/"follow"
+    #      on purpose, since those verbs are common in ordinary
+    #      company-research phrasing too (e.g. "keep track of Tesla's
+    #      earnings") and would cause false positives if included here.
+    _WATCHLIST_MENTION_KEYWORDS = ("watchlist", "watch list")
+    _WATCHLIST_REMOVE_KEYWORDS = ("remove", "drop", "delete", "untrack", "unfollow")
+
+    has_watchlist_mention = any(kw in text_lower for kw in _WATCHLIST_MENTION_KEYWORDS)
+    has_watchlist_removal = has_entities and any(
+        kw in text_lower for kw in _WATCHLIST_REMOVE_KEYWORDS
+    )
+    has_watchlist_cue = has_watchlist_mention or has_watchlist_removal
+
+    if has_watchlist_cue:
+        if intent == Intent.AMBIGUOUS or confidence < 0.45:
+            intent = Intent.WATCHLIST
+            confidence = max(confidence, 0.9)
+    elif has_entities or has_financial_cue:
         if intent == Intent.AMBIGUOUS or confidence < 0.45:
             if has_entities:
                 intent = Intent.COMPANY_RESEARCH
@@ -520,10 +529,73 @@ async def document_qa_node(state: AgentState) -> AgentState:
 
 async def watchlist_node(state: AgentState) -> AgentState:
     """
-    Handle watchlist add/remove/view requests.
-    Temporarily stubbed while WatchlistService dependency is detached.
+    Handle watchlist add/remove/view requests by calling WatchlistService
+    directly. The specific action (add/remove/view) is inferred from
+    keywords in the message text, combined with any tickers/company names
+    already extracted during intent classification.
     """
-    state["tool_result"] = json.dumps({"watchlist": []}, default=str)
+    services = state["services"]
+    watchlist_service = services.get("watchlist_service")
+    telegram_id = state["user_id"]
+    text_lower = state["text"].lower()
+    entities = state.get("entities", {})
+    tickers: list[str] = entities.get("tickers") or []
+
+    if watchlist_service is None:
+        state["tool_result"] = None
+        state["error"] = "watchlist_service_unavailable"
+        return state
+
+    remove_keywords = ("remove", "drop", "untrack", "delete", "unfollow")
+    add_keywords = ("add", "track", "watch", "follow", "monitor")
+
+    if any(kw in text_lower for kw in remove_keywords):
+        action = "remove"
+    elif tickers:
+        # Ticker(s) present with no explicit verb, or an explicit add verb
+        # -- default to add, since that's the far more common phrasing.
+        action = "add"
+    else:
+        action = "view"
+
+    try:
+        async with AsyncSessionLocal() as session:
+            if action == "add" and tickers:
+                added: list[str] = []
+                failed: list[dict[str, str]] = []
+                for ticker in tickers:
+                    try:
+                        entry = await watchlist_service.add_ticker(
+                            session, telegram_id=telegram_id, symbol=ticker
+                        )
+                        added.append(entry.symbol)
+                    except (InvalidTickerError, DuplicateTickerError, WatchlistFullError) as exc:
+                        failed.append({"ticker": ticker, "reason": str(exc)})
+                result_payload: dict[str, Any] = {"action": "add", "added": added, "failed": failed}
+
+            elif action == "remove" and tickers:
+                removed: list[str] = []
+                failed = []
+                for ticker in tickers:
+                    try:
+                        await watchlist_service.remove_ticker(
+                            session, telegram_id=telegram_id, symbol=ticker
+                        )
+                        removed.append(ticker.upper())
+                    except TickerNotOnWatchlistError as exc:
+                        failed.append({"ticker": ticker, "reason": str(exc)})
+                result_payload = {"action": "remove", "removed": removed, "failed": failed}
+
+            else:
+                current = await watchlist_service.get_symbols(session, telegram_id=telegram_id)
+                result_payload = {"action": "view", "watchlist": current}
+
+        state["tool_result"] = json.dumps(result_payload, default=str)
+    except WatchlistError as exc:
+        logger.exception("Watchlist operation failed for telegram_id=%s", telegram_id)
+        state["error"] = f"watchlist_op_failed: {exc}"
+        state["tool_result"] = None
+
     return state
 
 
