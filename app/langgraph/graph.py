@@ -35,6 +35,7 @@ from app.services.watchlist_service import (
 # Adjust this import if a shared `app/services/llm_service.py` (or similar)
 # already exists in the real codebase.
 from app.config import Environment, get_settings
+from app.prompts.system_prompt import compose_system_prompt
 
 settings = get_settings()
 
@@ -1089,8 +1090,41 @@ async def compose_response_node(state: AgentState) -> AgentState:
 
     prompt = "\n\n".join(prompt_parts)
 
+    # Build a personalized system prompt if we have user profile data.
+    # compose_system_prompt() appends a "Personalization notes:" block only
+    # when first_name / preferences are non-empty, so there is zero behaviour
+    # change for users who haven't completed onboarding yet.
+    user_profile = state.get("user_profile")
+    first_name: Optional[str] = None
+    preferences: Optional[str] = None
+    if user_profile is not None:
+        raw_name: str | None = getattr(user_profile, "full_name", None)
+        first_name = raw_name.split()[0] if raw_name else None
+
+        # Assemble a short preference summary from every populated field.
+        pref_parts: list[str] = []
+        notes: str | None = getattr(user_profile, "notes", None)
+        if notes:
+            pref_parts.append(notes)
+        followed_companies = getattr(user_profile, "followed_companies", None)
+        if followed_companies:
+            pref_parts.append(f"Interested in companies/tickers: {followed_companies}")
+        followed_sectors = getattr(user_profile, "followed_sectors", None)
+        if followed_sectors:
+            pref_parts.append(f"Followed sectors: {followed_sectors}")
+        insight_prefs = getattr(user_profile, "insight_preferences", None)
+        if insight_prefs:
+            pref_parts.append(f"Insight preferences: {insight_prefs}")
+        preferences = ". ".join(pref_parts) if pref_parts else None
+
+    effective_system_prompt = compose_system_prompt(
+        _RESPONSE_SYSTEM_PROMPT,
+        first_name=first_name,
+        preferences=preferences,
+    )
+
     try:
-        reply = await _call_gemini(prompt, system_instruction=_RESPONSE_SYSTEM_PROMPT)
+        reply = await _call_gemini(prompt, system_instruction=effective_system_prompt)
     except Exception as exc:  # noqa: BLE001
         tb = traceback.format_exc()
         logger.exception("Failed to compose final response")
