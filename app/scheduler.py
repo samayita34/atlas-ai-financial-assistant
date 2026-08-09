@@ -43,6 +43,8 @@ from app.config import get_settings
 
 settings = get_settings()
 from app.database.database import AsyncSessionLocal
+from app.database.models import AlertCondition
+from app.services.alert_service import AlertError, AlertService
 from app.services.financial_data_service import (
     FinancialDataError,
     FinancialDataService,
@@ -79,6 +81,11 @@ WATCHLIST_ALERT_THRESHOLD_PERCENT: Final[float] = getattr(
 MAX_BRIEFING_TICKERS: Final[int] = 5  # cap per-user briefing length
 BRIEFING_JOB_ID: Final[str] = "daily_market_briefing"
 WATCHLIST_ALERT_JOB_ID: Final[str] = "watchlist_alert_check"
+
+PRICE_ALERT_INTERVAL_MINUTES: Final[int] = getattr(
+    settings, "price_alert_interval_minutes", 1
+)
+PRICE_ALERT_JOB_ID: Final[str] = "price_alert_check"
 
 SEND_CONCURRENCY_LIMIT: Final[int] = 10  # cap parallel Telegram sends
 
@@ -443,6 +450,104 @@ async def run_watchlist_alert_job(
     logger.info("Watchlist alert job complete. Alerts sent to %d user(s).", len(send_tasks))
 
 
+async def run_price_alert_job(
+    bot: Bot,
+    financial_data_service: FinancialDataService,
+) -> None:
+    """
+    Check all active price alerts, fetch current prices via
+    FinancialDataService, and trigger (notify + deactivate) any alert
+    whose condition is now met.
+
+    Registered as an interval job (see `create_scheduler`), running every
+    `PRICE_ALERT_INTERVAL_MINUTES` minutes.
+
+    Each alert is deactivated in its own short-lived session BEFORE its
+    Telegram notification is sent -- this ordering (not the reverse)
+    guarantees an alert can never be re-triggered and re-notified twice
+    for the same crossing, even if the Telegram send itself fails
+    afterward (that failure is only logged, per `_send_message_safely`).
+    """
+    logger.info("Running price alert check...")
+
+    alert_service = AlertService()
+
+    async with AsyncSessionLocal() as session:
+        try:
+            active_alerts = await alert_service.get_active_alerts(session)
+        except AlertError:
+            logger.exception("Failed to load active price alerts; aborting job run.")
+            return
+
+    if not active_alerts:
+        logger.info("No active price alerts; skipping.")
+        return
+
+    # De-duplicate ticker lookups across alerts to minimize Finnhub calls
+    # (mirrors the same dedup pattern used in run_watchlist_alert_job).
+    unique_symbols = {alert.symbol for alert in active_alerts}
+    quotes: dict[str, Optional[float]] = {}
+    for symbol in unique_symbols:
+        try:
+            quote = await financial_data_service.get_quote(symbol)
+            quotes[symbol] = quote.current_price
+        except FinancialDataError:
+            logger.warning("Skipping price alert check for %r (quote unavailable)", symbol)
+            quotes[symbol] = None
+
+    semaphore = asyncio.Semaphore(SEND_CONCURRENCY_LIMIT)
+    send_tasks: list[asyncio.Task[None]] = []
+    triggered_count = 0
+
+    for alert in active_alerts:
+        current_price = quotes.get(alert.symbol)
+        if current_price is None:
+            continue
+
+        condition_met = (
+            alert.condition == AlertCondition.ABOVE and current_price > alert.target_price
+        ) or (
+            alert.condition == AlertCondition.BELOW and current_price < alert.target_price
+        )
+        if not condition_met:
+            continue
+
+        # Deactivate first, in its own session -- see docstring note on
+        # ordering. If this fails, skip the notification entirely rather
+        # than notify-then-fail-to-deactivate (which would repeat-notify
+        # on every subsequent run).
+        async with AsyncSessionLocal() as session:
+            try:
+                await alert_service.mark_triggered(session, alert_id=alert.id)
+            except AlertError:
+                logger.exception(
+                    "Failed to mark alert_id=%s as triggered; skipping "
+                    "notification to avoid a repeat trigger next run.",
+                    alert.id,
+                )
+                continue
+
+        triggered_count += 1
+        direction_word = "risen above" if alert.condition == AlertCondition.ABOVE else "fallen below"
+        arrow = "📈" if alert.condition == AlertCondition.ABOVE else "📉"
+        alert_text = (
+            f"🔔 *Price Alert Triggered*\n\n"
+            f"{arrow} *{alert.symbol}* has {direction_word} "
+            f"${alert.target_price:,.2f}\n"
+            f"Current price: ${current_price:,.2f}"
+        )
+        send_tasks.append(
+            asyncio.create_task(
+                _send_message_safely(bot, alert.telegram_id, alert_text, semaphore=semaphore)
+            )
+        )
+
+    if send_tasks:
+        await asyncio.gather(*send_tasks, return_exceptions=True)
+
+    logger.info("Price alert job complete. %d alert(s) triggered.", triggered_count)
+
+
 # ---------------------------------------------------------------------------
 # Scheduler factory
 # ---------------------------------------------------------------------------
@@ -510,6 +615,21 @@ def create_scheduler(
         },
         replace_existing=True,
         misfire_grace_time=60 * 5,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    scheduler.add_job(
+        run_price_alert_job,
+        trigger=IntervalTrigger(minutes=PRICE_ALERT_INTERVAL_MINUTES),
+        id=PRICE_ALERT_JOB_ID,
+        name="Price alert check",
+        kwargs={
+            "bot": bot,
+            "financial_data_service": financial_data_service,
+        },
+        replace_existing=True,
+        misfire_grace_time=60 * 2,
         coalesce=True,
         max_instances=1,
     )

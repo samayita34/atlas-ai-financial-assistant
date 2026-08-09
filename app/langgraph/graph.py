@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -11,9 +12,14 @@ from typing import Any, Optional, TypedDict, cast
 from langgraph.graph import END, StateGraph
 
 from app.database.database import AsyncSessionLocal
-from app.database.models import ConversationMessage, User
+from app.database.models import AlertCondition, ConversationMessage, User
+from app.services.alert_service import AlertError, AlertService
 from app.services.document_service import DocumentService
-from app.services.financial_data_service import FinancialDataService
+from app.services.financial_data_service import (
+    FinancialDataError,
+    FinancialDataService,
+    SymbolNotFoundError,
+)
 from app.services.memory_service import MemoryService
 from app.services.watchlist_service import (
     DuplicateTickerError,
@@ -75,6 +81,7 @@ class Intent(str, Enum):
     COMPANY_RESEARCH = "company_research"
     DOCUMENT_QA = "document_qa"
     WATCHLIST = "watchlist"
+    PRICE_ALERT = "price_alert"
     CONVERSATION = "conversation"
     AMBIGUOUS = "ambiguous"
 
@@ -222,6 +229,8 @@ financial metrics, news, or comparisons between companies.
 (earnings report, SEC filing, annual report), or referring to "the report", \
 "the filing", "this document", etc.
 - watchlist: asking to add/remove/view tickers on their watchlist.
+- price_alert: asking to be notified/alerted when a ticker's price goes \
+above or below a specific dollar value.
 - conversation: greetings, small talk, thanks, general assistant questions \
 not requiring live data or documents.
 - ambiguous: the request could plausibly map to more than one category \
@@ -354,7 +363,28 @@ def _fallback_entity_extraction(
     )
     has_watchlist_cue = has_watchlist_mention or has_watchlist_removal
 
-    if has_watchlist_cue:
+    # Price-alert phrasing must win over BOTH the watchlist and
+    # company-research fallbacks below -- "alert me when AAPL goes above
+    # $320" contains a ticker (like company research) and could contain
+    # "watch"-adjacent wording, so it needs to be checked first. Requires
+    # an explicit alert/notify phrase AND an above/below/over/under
+    # direction word, so it doesn't fire on ordinary research phrasing.
+    _PRICE_ALERT_KEYWORDS = (
+        "alert me when", "notify me when", "alert when", "notify when", "price alert",
+    )
+    has_price_alert_cue = (
+        has_entities
+        and any(kw in text_lower for kw in _PRICE_ALERT_KEYWORDS)
+        and any(
+            word in text_lower for word in ("above", "below", "over", "under")
+        )
+    )
+
+    if has_price_alert_cue:
+        if intent == Intent.AMBIGUOUS or confidence < 0.45:
+            intent = Intent.PRICE_ALERT
+            confidence = max(confidence, 0.9)
+    elif has_watchlist_cue:
         if intent == Intent.AMBIGUOUS or confidence < 0.45:
             intent = Intent.WATCHLIST
             confidence = max(confidence, 0.9)
@@ -365,6 +395,62 @@ def _fallback_entity_extraction(
                 confidence = max(confidence, 0.9)
 
     return intent, confidence, updated_entities
+
+
+_ALERT_CONDITION_KEYWORDS: dict[str, AlertCondition] = {
+    "greater than": AlertCondition.ABOVE,
+    "above": AlertCondition.ABOVE,
+    "over": AlertCondition.ABOVE,
+    "exceeds": AlertCondition.ABOVE,
+    "less than": AlertCondition.BELOW,
+    "falls below": AlertCondition.BELOW,
+    "below": AlertCondition.BELOW,
+    "under": AlertCondition.BELOW,
+}
+
+
+def _parse_price_alert_request(
+    text: str, tickers: list[str]
+) -> Optional[tuple[str, AlertCondition, float]]:
+    """
+    Parse a price-alert request like "alert me when AAPL goes above $320"
+    into (symbol, condition, target_price).
+
+    Returns None if no ticker was extracted, or the message doesn't
+    contain a recognizable condition keyword followed by a numeric price
+    -- callers should treat None as "could not create the alert" and
+    surface that as an error rather than guessing.
+    """
+    if not tickers:
+        return None
+
+    text_lower = text.lower()
+    matched_condition: Optional[AlertCondition] = None
+    keyword_end = -1
+
+    for keyword, cond in _ALERT_CONDITION_KEYWORDS.items():
+        pos = text_lower.find(keyword)
+        if pos != -1:
+            matched_condition = cond
+            keyword_end = pos + len(keyword)
+            break
+
+    if matched_condition is None:
+        return None
+
+    # Look for a numeric price at or after the condition keyword (handles
+    # "$320", "320", "320.50").
+    remainder = text[keyword_end:]
+    price_match = re.search(r"\$?\s*(\d+(?:\.\d+)?)", remainder)
+    if price_match is None:
+        return None
+
+    try:
+        target_price = float(price_match.group(1))
+    except ValueError:
+        return None
+
+    return tickers[0], matched_condition, target_price
 
 
 async def classify_intent_node(state: AgentState) -> AgentState:
@@ -468,8 +554,16 @@ async def clarify_node(state: AgentState) -> AgentState:
 
 async def company_research_node(state: AgentState) -> AgentState:
     """
-    Fetch live financial data for the requested company/ticker via
+    Fetch live financial data for the requested company/companies via
     FinancialDataService and summarize it concisely.
+
+    Single-company requests behave exactly as before. When two entities
+    are extracted (a comparison request, e.g. "compare Apple and
+    Microsoft"), both companies are fetched concurrently via
+    ``asyncio.gather`` and both datasets are passed downstream together.
+    If one lookup fails, the other's data is still returned -- the
+    failure is attributed to its specific ticker/name rather than
+    silently dropped or fabricated.
     """
     services = state["services"]
     financial_data_service = services["financial_data_service"]
@@ -477,6 +571,51 @@ async def company_research_node(state: AgentState) -> AgentState:
 
     tickers: list[str] = entities.get("tickers") or []
     company_names: list[str] = entities.get("company_names") or []
+
+    # Comparison request: exactly two distinct entities were extracted.
+    # Prefer tickers (more precise); fall back to company names only if
+    # fewer than two tickers were extracted. Only ever compares the first
+    # two -- this does not attempt an N-way comparison.
+    if len(tickers) >= 2:
+        compare_queries = tickers[:2]
+    elif len(company_names) >= 2:
+        compare_queries = company_names[:2]
+    else:
+        compare_queries = None
+
+    if compare_queries is not None:
+        results = await asyncio.gather(
+            *(
+                financial_data_service.get_company_overview(entity)
+                for entity in compare_queries
+            ),
+            return_exceptions=True,
+        )
+
+        companies: dict[str, object] = {}
+        unavailable: dict[str, str] = {}
+        for entity, result in zip(compare_queries, results, strict=True):
+            if isinstance(result, Exception):
+                logger.exception(
+                    "FinancialDataService lookup failed for %r", entity
+                )
+                unavailable[entity] = str(result)
+            else:
+                companies[entity] = result
+
+        if not companies:
+            # Both lookups failed -- same failure shape as the
+            # single-company branch below.
+            state["error"] = f"financial_lookup_failed: {unavailable}"
+            state["tool_result"] = None
+            return state
+
+        payload: dict[str, object] = {"comparison": companies}
+        if unavailable:
+            payload["unavailable"] = unavailable
+        state["tool_result"] = json.dumps(payload, default=str)
+        return state
+
     query = tickers[0] if tickers else (company_names[0] if company_names else state["text"])
 
     try:
@@ -828,6 +967,71 @@ async def watchlist_node(state: AgentState) -> AgentState:
     return state
 
 
+async def price_alert_node(state: AgentState) -> AgentState:
+    """
+    Parse and persist a price alert request (e.g. "alert me when AAPL
+    goes above $320"). The ticker is validated/normalized via
+    FinancialDataService before being stored, the same validation
+    WatchlistService performs before persisting a watchlist add.
+    """
+    services = state["services"]
+    financial_data_service = services["financial_data_service"]
+    telegram_id = state["user_id"]
+    entities = state.get("entities", {})
+    tickers: list[str] = entities.get("tickers") or []
+
+    parsed = _parse_price_alert_request(state["text"], tickers)
+    if parsed is None:
+        state["tool_result"] = None
+        state["error"] = (
+            "price_alert_parse_failed: could not determine the ticker, "
+            "condition (above/below), and target price from the message"
+        )
+        return state
+
+    raw_symbol, condition, target_price = parsed
+
+    try:
+        resolved_symbol = await financial_data_service.resolve_symbol(raw_symbol)
+        # Confirm the symbol has live data behind it -- same guard
+        # WatchlistService applies before persisting a watchlist add.
+        await financial_data_service.get_quote(resolved_symbol)
+    except SymbolNotFoundError:
+        state["tool_result"] = None
+        state["error"] = f"price_alert_invalid_symbol: {raw_symbol!r} is not a recognized ticker"
+        return state
+    except FinancialDataError as exc:
+        state["tool_result"] = None
+        state["error"] = f"price_alert_symbol_validation_failed: {exc}"
+        return state
+
+    alert_service = AlertService()
+    try:
+        async with AsyncSessionLocal() as session:
+            entry = await alert_service.create_alert(
+                session,
+                telegram_id=telegram_id,
+                symbol=resolved_symbol,
+                condition=condition,
+                target_price=target_price,
+            )
+        state["tool_result"] = json.dumps(
+            {
+                "action": "price_alert_created",
+                "symbol": entry.symbol,
+                "condition": entry.condition.value,
+                "target_price": entry.target_price,
+            },
+            default=str,
+        )
+    except AlertError as exc:
+        logger.exception("Failed to create price alert for telegram_id=%s", telegram_id)
+        state["error"] = f"price_alert_creation_failed: {exc}"
+        state["tool_result"] = None
+
+    return state
+
+
 # ---------------------------------------------------------------------------
 # Node: plain conversation
 # ---------------------------------------------------------------------------
@@ -959,6 +1163,7 @@ def _route_after_classification(state: AgentState) -> str:
         Intent.COMPANY_RESEARCH: "company_research",
         Intent.DOCUMENT_QA: "document_qa",
         Intent.WATCHLIST: "watchlist",
+        Intent.PRICE_ALERT: "price_alert",
         Intent.CONVERSATION: "conversation",
         Intent.AMBIGUOUS: "clarify",
     }[intent]
@@ -992,6 +1197,7 @@ def build_graph() -> StateGraph:
     graph.add_node("company_research", company_research_node)
     graph.add_node("document_qa", document_qa_node)
     graph.add_node("watchlist", watchlist_node)
+    graph.add_node("price_alert", price_alert_node)
     graph.add_node("conversation", conversation_node)
     graph.add_node("compose_response", compose_response_node)
 
@@ -1016,6 +1222,7 @@ def build_graph() -> StateGraph:
             "company_research": "company_research",
             "document_qa": "document_qa",
             "watchlist": "watchlist",
+            "price_alert": "price_alert",
             "conversation": "conversation",
         },
     )
@@ -1023,6 +1230,7 @@ def build_graph() -> StateGraph:
     graph.add_edge("company_research", "compose_response")
     graph.add_edge("document_qa", "compose_response")
     graph.add_edge("watchlist", "compose_response")
+    graph.add_edge("price_alert", "compose_response")
     graph.add_edge("conversation", "compose_response")
 
     graph.add_edge("clarify", END)

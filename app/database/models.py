@@ -34,6 +34,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -95,6 +96,13 @@ class BriefStatus(str, enum.Enum):
     PENDING = "pending"
     SENT = "sent"
     FAILED = "failed"
+
+
+class AlertCondition(str, enum.Enum):
+    """Direction of the price threshold a PriceAlert is watching for."""
+
+    ABOVE = "above"
+    BELOW = "below"
 
 
 # ---------------------------------------------------------------------------
@@ -434,3 +442,46 @@ class WatchlistItem(Base):
 
     def __repr__(self) -> str:
         return f"<WatchlistItem id={self.id} telegram_id={self.telegram_id} symbol={self.symbol}>"
+
+
+# ---------------------------------------------------------------------------
+# PriceAlert
+# ---------------------------------------------------------------------------
+class PriceAlert(Base):
+    """
+    A user-created price alert (e.g. "alert me when AAPL goes above $320").
+
+    Checked periodically by the scheduler's price-alert job. Deactivated
+    (`is_active=False`, `triggered_at` set) the moment it fires, so it is
+    never re-checked or re-notified.
+    """
+
+    __tablename__ = "price_alerts"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    telegram_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    condition: Mapped[AlertCondition] = mapped_column(
+        Enum(AlertCondition, name="alert_condition"), nullable=False
+    )
+    target_price: Mapped[float] = mapped_column(Float, nullable=False)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    triggered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_price_alerts_telegram_id_is_active", "telegram_id", "is_active"),
+        Index("ix_price_alerts_symbol_is_active", "symbol", "is_active"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PriceAlert id={self.id} telegram_id={self.telegram_id} "
+            f"symbol={self.symbol} {self.condition.value} {self.target_price}>"
+        )

@@ -42,14 +42,24 @@ logger = logging.getLogger(__name__)
 
 # TODO: Confirm attribute name on `settings`; assuming `gemini_api_key` is
 # defined in app/config.py (shared with langgraph/graph.py's Gemini usage).
-GEMINI_API_KEY: Final[str] = getattr(settings, "gemini_api_key", "")
+GEMINI_API_KEY: Final[str] = (
+    settings.gemini_api_key.get_secret_value()
+    if settings.gemini_api_key
+    else ""
+)
 
-# TODO: Confirm whether a distinct model is preferred for audio
-# transcription vs. text generation. Assuming a single configurable
-# model name, defaulting to a current Gemini flash model with audio
-# support.
+# Reuses the project's already-configured `settings.gemini_model` (the
+# same model already proven working for chat generation elsewhere in this
+# project) as the transcription model default. Gemini's flash-tier models
+# are natively multimodal (audio input included), so a second,
+# independently-versioned model name here serves no purpose and is a
+# liability: it can silently drift out of date without anyone noticing,
+# exactly as the prior hardcoded "gemini-2.5-flash" default did here.
+#
+# Still overridable via a `gemini_transcription_model_name` setting if one
+# is ever added to app/config.py.
 GEMINI_TRANSCRIPTION_MODEL_NAME: Final[str] = getattr(
-    settings, "gemini_transcription_model_name", "gemini-2.0-flash"
+    settings, "gemini_transcription_model_name", settings.gemini_model
 )
 
 DEFAULT_TIMEOUT_SECONDS: Final[float] = 30.0
@@ -280,7 +290,8 @@ class SpeechService:
                     continue
                 logger.exception("Gemini transcription failed after retries.")
                 raise TranscriptionRequestError(
-                    f"Transcription request failed after {MAX_RETRIES} retries."
+                    f"Transcription request failed after {MAX_RETRIES} "
+                    f"retries: {exc}"
                 ) from exc
 
         # Unreachable, but keeps type checkers happy.

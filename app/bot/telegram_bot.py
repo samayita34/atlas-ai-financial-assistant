@@ -383,7 +383,7 @@ def setup_bot(
         _watchlist_service = watchlist_service
 
     active_bot = bot or create_bot()
-    dp = Dispatcher()
+    dp = Dispatcher() 
     dp.include_router(router)
 
     return active_bot, dp
