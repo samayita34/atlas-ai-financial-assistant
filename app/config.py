@@ -118,7 +118,7 @@ class Settings(BaseSettings):
         description="Gemini model id used for agent reasoning and generation.",
     )
     embedding_model: str = Field(
-        default="text-embedding-004",
+        default="gemini-embedding-001",
         description="Embedding model id used by rag/embeddings.py for document and query embeddings.",
     )
     transcription_api_key: SecretStr | None = Field(

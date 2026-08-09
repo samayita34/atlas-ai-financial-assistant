@@ -16,3 +16,5 @@ pdfplumber
 python-multipart
 faiss-cpu
 finnhub-python
+sentence-transformers
+pypdf

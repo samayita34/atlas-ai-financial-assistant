@@ -27,11 +27,12 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional
 
 from aiogram import Bot, Dispatcher
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from app.bot.telegram_bot import setup_bot
-from app.config import get_settings
+from app.config import Environment, get_settings
 
 settings = get_settings()
 from app.database.database import (
@@ -39,9 +40,11 @@ from app.database.database import (
     close_db,
     init_db,
 )
+from app.scheduler import create_scheduler, trigger_daily_briefing_now
 from app.services.document_service import DocumentService
 from app.services.financial_data_service import FinancialDataService
 from app.services.memory_service import MemoryService
+from app.services.watchlist_service import WatchlistService
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +64,11 @@ class AppState:
         self.memory_service: Optional[MemoryService] = None
         self.financial_data_service: Optional[FinancialDataService] = None
         self.document_service: Optional[DocumentService] = None
+        self.watchlist_service: Optional[WatchlistService] = None
         self.bot: Optional[Bot] = None
         self.dispatcher: Optional[Dispatcher] = None
         self.polling_task: Optional[asyncio.Task[None]] = None
+        self.scheduler: Optional[AsyncIOScheduler] = None
 
 
 app_state = AppState()
@@ -121,16 +126,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     memory_service = MemoryService(session)
     financial_data_service = FinancialDataService()
     document_service = DocumentService(session)
+    # NOTE: previously not constructed here at all — telegram_bot.py's
+    # per-request fallback (`_watchlist_service or WatchlistService(...)`)
+    # meant a fresh instance was created on every message. WatchlistService
+    # is stateless aside from holding `financial_data_service`, so this is
+    # a pure wiring fix (same pattern as the other services), not a change
+    # to the Watchlist implementation itself. It's also required so the
+    # scheduler can query the same watchlist data the bot uses.
+    watchlist_service = WatchlistService(financial_data_service=financial_data_service)
 
     app_state.memory_service = memory_service
     app_state.financial_data_service = financial_data_service
     app_state.document_service = document_service
+    app_state.watchlist_service = watchlist_service
 
     # ---- Telegram bot ----------------------------------------------------
     bot, dispatcher = setup_bot(
         memory_service=memory_service,
         financial_data_service=financial_data_service,
         document_service=document_service,
+        watchlist_service=watchlist_service,
     )
     app_state.bot = bot
     app_state.dispatcher = dispatcher
@@ -141,10 +156,36 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app_state.polling_task = polling_task
     logger.info("Telegram bot polling started.")
 
+    # ---- Scheduler (daily briefing + watchlist alerts) -------------------
+    # This was previously never constructed/started anywhere in the app —
+    # `create_scheduler` existed in scheduler.py but nothing called it
+    # outside that module's own standalone `__main__` block, so the daily
+    # briefing cron job never ran in the deployed service.
+    scheduler = create_scheduler(
+        bot=bot,
+        memory_service=memory_service,
+        financial_data_service=financial_data_service,
+        watchlist_service=watchlist_service,
+    )
+    scheduler.start()
+    app_state.scheduler = scheduler
+    logger.info(
+        "Scheduler started. Daily briefing job registered: %s",
+        scheduler.get_job("daily_market_briefing") is not None,
+    )
+
     try:
         yield
     finally:
         logger.info("Shutting down Atlas AI Financial Assistant...")
+
+        # ---- Stop scheduler (before the bot session closes, so no
+        # in-flight job tries to send through a closed session) ---------
+        if app_state.scheduler is not None:
+            try:
+                app_state.scheduler.shutdown(wait=False)
+            except Exception:  # noqa: BLE001
+                logger.exception("Error while shutting down scheduler.")
 
         # ---- Stop Telegram polling ----------------------------------
         if app_state.dispatcher is not None:
@@ -216,6 +257,52 @@ async def health_check() -> JSONResponse:
 async def root() -> JSONResponse:
     """Basic root endpoint confirming the service is up."""
     return JSONResponse(content={"service": "atlas-ai-financial-assistant", "status": "running"})
+
+
+@app.post("/debug/trigger-daily-briefing", tags=["debug"])
+async def debug_trigger_daily_briefing(telegram_id: Optional[int] = None) -> JSONResponse:
+    """
+    Manually run the daily briefing job right now, using the exact same
+    scheduler-registered `bot`/`memory_service`/`financial_data_service`/
+    `watchlist_service` instances the real cron job uses — this is not a
+    simulation, it IS the job, invoked on demand.
+
+    Query param `telegram_id`: if provided, only that user's briefing is
+    built and sent (recommended for testing). Omit to run against every
+    user, exactly like the real 08:00 cron firing would.
+
+    This does NOT modify the registered `CronTrigger` — the scheduled job
+    still fires at its configured time regardless of how many times this
+    endpoint is called.
+
+    Disabled in production as a safety measure, since it can message real
+    users on demand.
+    """
+    if settings.environment == Environment.PRODUCTION:
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Manual briefing trigger is disabled in production."},
+        )
+
+    if (
+        app_state.bot is None
+        or app_state.memory_service is None
+        or app_state.financial_data_service is None
+        or app_state.watchlist_service is None
+    ):
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Services not fully initialized yet."},
+        )
+
+    summary = await trigger_daily_briefing_now(
+        bot=app_state.bot,
+        memory_service=app_state.memory_service,
+        financial_data_service=app_state.financial_data_service,
+        watchlist_service=app_state.watchlist_service,
+        telegram_id=telegram_id,
+    )
+    return JSONResponse(content={"telegram_id_filter": telegram_id, **summary})
 
 
 # TODO: If Atlas grows additional HTTP surface area (e.g. a REST API for

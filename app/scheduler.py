@@ -48,6 +48,7 @@ from app.services.financial_data_service import (
     FinancialDataService,
 )
 from app.services.memory_service import MemoryService
+from app.services.watchlist_service import WatchlistError, WatchlistService
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +56,17 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-# TODO: Confirm these against app/config.py; assuming sensible defaults if
-# the settings object doesn't define them (e.g. for local/dev environments).
-DAILY_BRIEFING_HOUR: Final[int] = getattr(settings, "daily_briefing_hour", 8)
-DAILY_BRIEFING_MINUTE: Final[int] = getattr(settings, "daily_briefing_minute", 0)
-DAILY_BRIEFING_TIMEZONE: Final[str] = getattr(settings, "scheduler_timezone", "UTC")
+# `Settings` (app/config.py) exposes the send time as a single "HH:MM"
+# string (`default_brief_time`) plus `default_brief_timezone` — there is
+# no `daily_briefing_hour`/`daily_briefing_minute`/`scheduler_timezone`
+# field. The previous getattr(..., default) calls always missed (Settings
+# is a Pydantic model, not a dict) and silently fell back to the hardcoded
+# defaults below, so the configured brief time/timezone was never actually
+# honored. Parse the real field instead.
+_brief_hour_str, _brief_minute_str = settings.default_brief_time.split(":")
+DAILY_BRIEFING_HOUR: Final[int] = int(_brief_hour_str)
+DAILY_BRIEFING_MINUTE: Final[int] = int(_brief_minute_str)
+DAILY_BRIEFING_TIMEZONE: Final[str] = settings.default_brief_timezone
 
 WATCHLIST_ALERT_INTERVAL_MINUTES: Final[int] = getattr(
     settings, "watchlist_alert_interval_minutes", 30
@@ -88,14 +95,23 @@ SEND_CONCURRENCY_LIMIT: Final[int] = 10  # cap parallel Telegram sends
 try:
     from google import genai  # type: ignore[import-not-found]
 
+    # `settings.gemini_api_key` is a SecretStr (see app/config.py) — the
+    # genai SDK needs the plain string. Passing the SecretStr object
+    # directly caused every briefing to silently fail this construction
+    # (or the first call) and fall through to the deterministic template,
+    # with no visible error.
     _genai_client: Optional["genai.Client"] = genai.Client(
-        api_key=getattr(settings, "gemini_api_key", None)
+        api_key=settings.gemini_api_key.get_secret_value()
     )
 except Exception:  # pragma: no cover - allows import without the SDK
     genai = None  # type: ignore[assignment]
     _genai_client = None
+    logger.exception("Failed to construct Gemini client for scheduled briefings.")
 
-GEMINI_MODEL_NAME: Final[str] = getattr(settings, "gemini_model_name", "gemini-2.0-flash")
+# `Settings` defines `gemini_model`, not `gemini_model_name` — the old
+# getattr(..., default) always missed and silently used the hardcoded
+# fallback below regardless of what was actually configured.
+GEMINI_MODEL_NAME: Final[str] = settings.gemini_model
 
 
 async def _summarize_briefing(user_first_name: str, overviews: list[dict[str, Any]]) -> str:
@@ -161,18 +177,27 @@ class UserBriefingTarget:
     watchlist: list[str]
 
 
-async def _get_all_briefing_targets(memory_service: MemoryService) -> list[UserBriefingTarget]:
+async def _get_all_briefing_targets(
+    memory_service: MemoryService,
+    watchlist_service: WatchlistService,
+    *,
+    only_telegram_id: Optional[int] = None,
+) -> list[UserBriefingTarget]:
     """
     Enumerate all users who should receive scheduled messages, along with
     their watchlist.
 
-    TODO: Assumed MemoryService method:
-        list_all_users(session) -> list[Any]
-    where each returned user object exposes `telegram_id`, `first_name`
-    (or similar display name), and either an eager-loaded `watchlist`
-    relationship or requires a separate `get_watchlist` call. This
-    implementation falls back to calling `get_watchlist` per user if the
-    user object has no `watchlist` attribute.
+    Watchlist data is read via `WatchlistService.get_symbols(...)`, which
+    is backed by the `WatchlistItem` table (the feature already tested
+    end-to-end through Telegram). It is intentionally NOT read from
+    `MemoryService.get_watchlist()` / `User.followed_companies` — that
+    field is only ever populated by the onboarding flow and is a separate,
+    unrelated store from the actual watchlist.
+
+    Args:
+        only_telegram_id: If provided, only that user is included (used by
+            the manual/debug trigger so a test run doesn't message every
+            real user).
     """
     targets: list[UserBriefingTarget] = []
     async with AsyncSessionLocal() as session:
@@ -182,18 +207,18 @@ async def _get_all_briefing_targets(memory_service: MemoryService) -> list[UserB
             telegram_id = getattr(user, "telegram_id", None)
             if telegram_id is None:
                 continue
+            if only_telegram_id is not None and telegram_id != only_telegram_id:
+                continue
 
-            watchlist = getattr(user, "watchlist", None) or getattr(user, "followed_companies", None)
-            if watchlist is None:
-                try:
-                    watchlist = await memory_service.get_watchlist(
-                        session, telegram_id=telegram_id
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "Failed to load watchlist for telegram_id=%s", telegram_id
-                    )
-                    watchlist = []
+            try:
+                watchlist = await watchlist_service.get_symbols(
+                    session, telegram_id=telegram_id
+                )
+            except WatchlistError:
+                logger.exception(
+                    "Failed to load watchlist for telegram_id=%s", telegram_id
+                )
+                watchlist = []
 
             first_name = getattr(user, "first_name", None) or getattr(user, "full_name", None)
             targets.append(
@@ -263,25 +288,52 @@ async def run_daily_briefing_job(
     bot: Bot,
     memory_service: MemoryService,
     financial_data_service: FinancialDataService,
-) -> None:
+    watchlist_service: WatchlistService,
+    *,
+    only_telegram_id: Optional[int] = None,
+) -> dict[str, Any]:
     """
     Send each user with a non-empty watchlist a personalized daily
     financial briefing.
 
     Registered as a cron job (see `create_scheduler`), typically run once
     per day at `DAILY_BRIEFING_HOUR:DAILY_BRIEFING_MINUTE`.
+
+    Args:
+        only_telegram_id: If provided, restricts this run to a single
+            user. Used by the manual/debug trigger (see
+            `trigger_daily_briefing_now`) so a test run never messages
+            every real user.
+
+    Returns:
+        A small summary dict (`targets_found`, `briefings_sent`,
+        `skipped_no_watchlist`, `failed`) — mainly useful for the manual
+        trigger to report back what actually happened, since the
+        scheduled path only logs this.
     """
-    logger.info("Running daily briefing job...")
+    logger.info("Running daily briefing job (only_telegram_id=%s)...", only_telegram_id)
+
+    summary: dict[str, Any] = {
+        "targets_found": 0,
+        "briefings_sent": 0,
+        "skipped_no_watchlist": 0,
+        "failed": 0,
+    }
 
     try:
-        targets = await _get_all_briefing_targets(memory_service)
+        targets = await _get_all_briefing_targets(
+            memory_service, watchlist_service, only_telegram_id=only_telegram_id
+        )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to enumerate briefing targets; aborting job run.")
-        return
+        summary["failed"] += 1
+        return summary
+
+    summary["targets_found"] = len(targets)
 
     if not targets:
         logger.info("No users found for daily briefing job.")
-        return
+        return summary
 
     semaphore = asyncio.Semaphore(SEND_CONCURRENCY_LIMIT)
     send_tasks: list[asyncio.Task[None]] = []
@@ -293,9 +345,11 @@ async def run_daily_briefing_job(
             logger.exception(
                 "Failed to build briefing for telegram_id=%s", target.telegram_id
             )
+            summary["failed"] += 1
             continue
 
         if briefing_text is None:
+            summary["skipped_no_watchlist"] += 1
             continue
 
         send_tasks.append(
@@ -309,13 +363,16 @@ async def run_daily_briefing_job(
     if send_tasks:
         await asyncio.gather(*send_tasks, return_exceptions=True)
 
+    summary["briefings_sent"] = len(send_tasks)
     logger.info("Daily briefing job complete. Sent to %d user(s).", len(send_tasks))
+    return summary
 
 
 async def run_watchlist_alert_job(
     bot: Bot,
     memory_service: MemoryService,
     financial_data_service: FinancialDataService,
+    watchlist_service: WatchlistService,
 ) -> None:
     """
     Check each user's watchlist tickers for significant intraday moves
@@ -333,7 +390,7 @@ async def run_watchlist_alert_job(
     logger.info("Running watchlist alert check...")
 
     try:
-        targets = await _get_all_briefing_targets(memory_service)
+        targets = await _get_all_briefing_targets(memory_service, watchlist_service)
     except Exception:  # noqa: BLE001
         logger.exception("Failed to enumerate watchlist targets; aborting job run.")
         return
@@ -396,6 +453,7 @@ def create_scheduler(
     bot: Bot,
     memory_service: MemoryService,
     financial_data_service: FinancialDataService,
+    watchlist_service: WatchlistService,
 ) -> AsyncIOScheduler:
     """
     Construct (but do not start) an `AsyncIOScheduler` with Atlas's
@@ -405,6 +463,8 @@ def create_scheduler(
         bot: Shared aiogram Bot instance used to deliver messages.
         memory_service: Shared MemoryService instance.
         financial_data_service: Shared FinancialDataService instance.
+        watchlist_service: Shared WatchlistService instance (source of
+            truth for per-user watchlists — see `_get_all_briefing_targets`).
 
     Returns:
         A configured `AsyncIOScheduler`. Call `.start()` to begin running
@@ -429,6 +489,7 @@ def create_scheduler(
             "bot": bot,
             "memory_service": memory_service,
             "financial_data_service": financial_data_service,
+            "watchlist_service": watchlist_service,
         },
         replace_existing=True,
         misfire_grace_time=60 * 30,  # tolerate up to 30 min scheduler downtime
@@ -445,6 +506,7 @@ def create_scheduler(
             "bot": bot,
             "memory_service": memory_service,
             "financial_data_service": financial_data_service,
+            "watchlist_service": watchlist_service,
         },
         replace_existing=True,
         misfire_grace_time=60 * 5,
@@ -458,6 +520,47 @@ def create_scheduler(
 def get_job(scheduler: AsyncIOScheduler, job_id: str) -> Optional[Job]:
     """Convenience accessor for inspecting a registered job (e.g. in tests/health checks)."""
     return scheduler.get_job(job_id)
+
+
+# ---------------------------------------------------------------------------
+# Manual trigger (for testing without waiting for the cron time)
+# ---------------------------------------------------------------------------
+
+
+async def trigger_daily_briefing_now(
+    *,
+    bot: Bot,
+    memory_service: MemoryService,
+    financial_data_service: FinancialDataService,
+    watchlist_service: WatchlistService,
+    telegram_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """
+    Run the exact same daily-briefing logic as the scheduled cron job,
+    on demand, without touching the registered `CronTrigger` or its
+    schedule.
+
+    This calls `run_daily_briefing_job` directly with the *same* bot and
+    service instances the real scheduled job uses — it is not a
+    simulation or a separate code path, so a successful manual run is
+    genuine end-to-end proof the scheduled job will also work.
+
+    Args:
+        telegram_id: If provided, only that user's briefing is built and
+            sent (recommended for testing, so a manual trigger doesn't
+            message every real user). Omit to run exactly like the real
+            scheduled job (all users).
+
+    Returns:
+        Summary dict from `run_daily_briefing_job` — see its docstring.
+    """
+    return await run_daily_briefing_job(
+        bot=bot,
+        memory_service=memory_service,
+        financial_data_service=financial_data_service,
+        watchlist_service=watchlist_service,
+        only_telegram_id=telegram_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -489,11 +592,13 @@ if __name__ == "__main__":  # pragma: no cover
         bot = create_bot()
         memory_service = MemoryService()  # type: ignore[call-arg]
         financial_data_service = FinancialDataService()
+        watchlist_service = WatchlistService(financial_data_service=financial_data_service)
 
         scheduler = create_scheduler(
             bot=bot,
             memory_service=memory_service,
             financial_data_service=financial_data_service,
+            watchlist_service=watchlist_service,
         )
         scheduler.start()
         logger.info("Scheduler started standalone. Press Ctrl+C to exit.")

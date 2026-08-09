@@ -4,13 +4,14 @@ import json
 import logging
 import re
 import traceback
+from datetime import time
 from enum import Enum
 from typing import Any, Optional, TypedDict, cast
 
 from langgraph.graph import END, StateGraph
 
 from app.database.database import AsyncSessionLocal
-from app.database.models import ConversationMessage
+from app.database.models import ConversationMessage, User
 from app.services.document_service import DocumentService
 from app.services.financial_data_service import FinancialDataService
 from app.services.memory_service import MemoryService
@@ -501,23 +502,251 @@ async def document_qa_node(state: AgentState) -> AgentState:
     Answer a question against the user's most recently uploaded document(s)
     using DocumentService (pgvector-backed retrieval).
     """
-    services = state["services"]
-    document_service = services["document_service"]
-    user_id = state["user_id"]
+    telegram_id = state["user_id"]
+
+    # Document.user_id is the internal UUID primary key (User.id), NOT the
+    # raw Telegram id -- same resolution load_context_node already performs
+    # for conversation history. Reuse its result instead of re-querying.
+    user_profile = state.get("user_profile")
+    if user_profile is None:
+        logger.error(
+            "document_qa_node: no resolved user_profile for telegram_id=%s; "
+            "cannot resolve internal User.id for document lookup",
+            telegram_id,
+        )
+        state["error"] = "document_qa_failed: user_profile not resolved"
+        state["tool_result"] = None
+        return state
 
     try:
         async with AsyncSessionLocal() as session:
             # DocumentService requires a session at construction time.
             doc_service = DocumentService(session)
             context = await doc_service.get_context_for_query(
-                user_id=user_id,
+                user_id=user_profile.id,
                 query=state["text"],
             )
         state["tool_result"] = context if context else "No relevant documents found."
     except Exception as exc:  # noqa: BLE001
-        logger.exception("DocumentService Q&A failed for user_id=%s", user_id)
+        logger.exception(
+            "DocumentService Q&A failed for user_id=%s", user_profile.id
+        )
         state["error"] = f"document_qa_failed: {exc}"
         state["tool_result"] = None
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Node: onboarding
+# ---------------------------------------------------------------------------
+
+# Each entry: (User column to fill, question text, Gemini extraction hint).
+# Order matters -- this *is* the onboarding sequence, inferred purely from
+# which of these columns is still empty. No separate progress counter is
+# needed, which means onboarding survives a mid-flow restart for free.
+#
+# "role" is intentionally NOT in this list: `User.role` is a typed
+# Enum(UserRole) with only ADMIN/USER values (access control), not a
+# persona field. The persona answer goes to `notes` (free Text) instead.
+_ONBOARDING_FIELDS: list[tuple[str, str]] = [
+    ("notes", "What best describes you — investor, analyst, founder, student, or finance professional?"),
+    ("followed_companies", "Which companies, sectors, or markets should I keep an eye on for you?"),
+    ("insight_preferences", "What matters most to you day to day — market news, earnings, SEC filings, analyst ratings, or macro events?"),
+    ("brief_time", "Last one — what time should I send your daily briefing? (e.g. \"8:00 AM\"), or say \"skip\" if you'd rather not get one."),
+]
+
+_SKIP_PHRASES = ("skip", "not now", "no thanks", "maybe later", "later")
+
+
+def _first_unset_onboarding_field(user: User) -> Optional[tuple[str, str]]:
+    """Return the (column, question) for the first still-empty onboarding
+    field, in order, or None if onboarding is complete."""
+    for field_name, question in _ONBOARDING_FIELDS:
+        if not getattr(user, field_name, None):
+            return field_name, question
+    return None
+
+
+async def _extract_companies_or_sectors(text: str) -> dict[str, Any]:
+    """One Gemini call: split a free-text answer into companies/sectors
+    lists. Falls back to an empty structure on any failure so onboarding
+    never gets stuck on a parsing error."""
+    prompt = f'User said: {text!r}\n\nExtract company names/tickers and sector names mentioned.'
+    try:
+        raw = await _call_gemini(
+            prompt,
+            system_instruction=(
+                'Respond ONLY with strict JSON: {"companies": [...], "sectors": [...]}. '
+                "Use company names or tickers as given; empty arrays if none mentioned."
+            ),
+            response_mime_type="application/json",
+        )
+        parsed = json.loads(raw) if raw else {}
+    except Exception:  # noqa: BLE001
+        logger.exception("Onboarding: failed to extract companies/sectors")
+        parsed = {}
+    return {
+        "companies": parsed.get("companies") or [],
+        "sectors": parsed.get("sectors") or [],
+    }
+
+
+async def _extract_insight_preferences(text: str) -> list[str]:
+    """One Gemini call: normalize a free-text answer into a short list of
+    insight-type tags. Falls back to storing the raw text as a single
+    item so the answer is never silently dropped."""
+    prompt = f'User said: {text!r}\n\nWhat type(s) of financial insight do they care about?'
+    try:
+        raw = await _call_gemini(
+            prompt,
+            system_instruction=(
+                'Respond ONLY with strict JSON: {"preferences": [...]}, '
+                "a short list of tags like \"market_news\", \"earnings\", \"sec_filings\", "
+                '"analyst_ratings", "macro_events". Infer from free text.'
+            ),
+            response_mime_type="application/json",
+        )
+        parsed = json.loads(raw) if raw else {}
+        prefs = parsed.get("preferences") or []
+        return prefs if prefs else [text.strip()]
+    except Exception:  # noqa: BLE001
+        logger.exception("Onboarding: failed to extract insight preferences")
+        return [text.strip()]
+
+
+def _parse_brief_time(text: str) -> Optional[time]:
+    """Best-effort parse of a free-text time answer into a `datetime.time`.
+    Deliberately simple (a couple of common formats) rather than another
+    Gemini call -- this field is the last question, so a parse miss should
+    never block onboarding from completing."""
+    cleaned = text.strip().lower().replace(".", "")
+    match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", cleaned)
+    if not match:
+        return None
+    hour_str, minute_str, meridiem = match.groups()
+    hour = int(hour_str)
+    minute = int(minute_str) if minute_str else 0
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return time(hour=hour, minute=minute)
+
+
+async def onboarding_node(state: AgentState) -> AgentState:
+    """
+    Drive a short, skippable, conversational onboarding flow for
+    first-time users instead of requiring the /start command.
+
+    The next question is inferred from whichever User column is still
+    unset -- naturally resumable across restarts, no progress counter
+    needed. If the message looks like a real request (has a ticker/company
+    per the same heuristics classify_intent uses) or says "skip", onboarding
+    is marked complete immediately; a real request falls through to
+    classify_intent for that same message instead of being blocked.
+    """
+    user_profile = state.get("user_profile")
+    text = state["text"]
+    text_lower = text.lower().strip()
+
+    if user_profile is None:
+        # Shouldn't happen -- telegram_bot.py always creates the user row
+        # before calling run_agent -- but fail safe into normal handling
+        # rather than blocking the user on a data inconsistency.
+        return state
+
+    wants_skip = any(p in text_lower for p in _SKIP_PHRASES)
+    _, _, enriched_entities = _fallback_entity_extraction(text, Intent.AMBIGUOUS, 0.0, {})
+    looks_like_real_request = bool(
+        enriched_entities.get("tickers") or enriched_entities.get("company_names")
+    )
+
+    is_very_first_message = not state.get("history")
+
+    async def _mark_complete_and_persist(**field_updates: Any) -> None:
+        async with AsyncSessionLocal() as session:
+            user = await session.get(User, user_profile.id)
+            if user is None:
+                return
+            for key, value in field_updates.items():
+                setattr(user, key, value)
+            user.onboarding_completed = True
+            await session.commit()
+
+    if wants_skip or (looks_like_real_request and not is_very_first_message):
+        await _mark_complete_and_persist()
+        if looks_like_real_request:
+            # Let this exact message flow through to classify_intent below.
+            return state
+        state["response"] = (
+            "No problem, we can skip that. Ask me anything, anytime — "
+            "stock research, watchlists, or upload a report to dig into."
+        )
+        return state
+
+    if is_very_first_message:
+        _, first_question = _ONBOARDING_FIELDS[0]
+        state["response"] = (
+            "Hey! I'm Atlas, your financial assistant. I'll keep this quick — "
+            f"{first_question}\n\n"
+            '(Say "skip" any time to jump straight to asking me things.)'
+        )
+        return state
+
+    # Not the first message and not a skip/real-request override: this
+    # message is the user's answer to whichever field is still unset.
+    pending = _first_unset_onboarding_field(user_profile)
+    if pending is None:
+        await _mark_complete_and_persist()
+        return state
+
+    field_name, _ = pending
+    field_updates: dict[str, Any] = {}
+
+    if field_name == "notes":
+        field_updates["notes"] = f"Persona: {text.strip()}"
+    elif field_name == "followed_companies":
+        extracted = await _extract_companies_or_sectors(text)
+        field_updates["followed_companies"] = extracted["companies"]
+        field_updates["followed_sectors"] = extracted["sectors"]
+    elif field_name == "insight_preferences":
+        field_updates["insight_preferences"] = await _extract_insight_preferences(text)
+    elif field_name == "brief_time":
+        parsed_time = _parse_brief_time(text)
+        if parsed_time is not None:
+            field_updates["brief_time"] = parsed_time
+        # If parsing fails, we intentionally still advance/complete rather
+        # than looping -- this is the last question, and getting stuck here
+        # would block a real user indefinitely over a formatting quirk.
+
+    # Reflect the update on the in-memory object so
+    # _first_unset_onboarding_field sees it as filled on this same pass.
+    for key, value in field_updates.items():
+        setattr(user_profile, key, value)
+
+    next_pending = _first_unset_onboarding_field(user_profile)
+
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, user_profile.id)
+        if user is not None:
+            for key, value in field_updates.items():
+                setattr(user, key, value)
+            if next_pending is None:
+                user.onboarding_completed = True
+            await session.commit()
+
+    if next_pending is None:
+        state["response"] = (
+            "That's everything I need for now — thanks! Ask me about a "
+            "stock, add something to your watchlist, or upload a report "
+            "any time."
+        )
+    else:
+        _, next_question = next_pending
+        state["response"] = next_question
 
     return state
 
@@ -702,6 +931,24 @@ async def compose_response_node(state: AgentState) -> AgentState:
 # ---------------------------------------------------------------------------
 
 
+def _route_after_context(state: AgentState) -> str:
+    """Conditional edge: send unonboarded users to onboarding_node instead
+    of classify_intent. This is what makes onboarding trigger on a brand
+    new user's first plain-text message -- no /start required."""
+    user_profile = state.get("user_profile")
+    if user_profile is not None and not getattr(user_profile, "onboarding_completed", True):
+        return "onboarding"
+    return "classify_intent"
+
+
+def _route_after_onboarding(state: AgentState) -> str:
+    """Conditional edge: if onboarding_node already produced a response
+    (asked a question / confirmed skip / confirmed completion), stop there.
+    If it left state["response"] empty, the message was a real request
+    that overrode onboarding -- fall through to classify_intent for it."""
+    return "end" if state.get("response") else "classify_intent"
+
+
 def _route_after_classification(state: AgentState) -> str:
     """Conditional edge: dispatch based on classified intent."""
     if state.get("clarification_needed"):
@@ -739,6 +986,7 @@ def build_graph() -> StateGraph:
     graph: StateGraph = StateGraph(AgentState)
 
     graph.add_node("load_context", load_context_node)
+    graph.add_node("onboarding", onboarding_node)
     graph.add_node("classify_intent", classify_intent_node)
     graph.add_node("clarify", clarify_node)
     graph.add_node("company_research", company_research_node)
@@ -748,7 +996,17 @@ def build_graph() -> StateGraph:
     graph.add_node("compose_response", compose_response_node)
 
     graph.set_entry_point("load_context")
-    graph.add_edge("load_context", "classify_intent")
+
+    graph.add_conditional_edges(
+        "load_context",
+        _route_after_context,
+        {"onboarding": "onboarding", "classify_intent": "classify_intent"},
+    )
+    graph.add_conditional_edges(
+        "onboarding",
+        _route_after_onboarding,
+        {"end": END, "classify_intent": "classify_intent"},
+    )
 
     graph.add_conditional_edges(
         "classify_intent",

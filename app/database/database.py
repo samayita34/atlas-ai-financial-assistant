@@ -81,6 +81,10 @@ async def init_db() -> None:
     try:
         async with engine.begin() as conn:
             await conn.execute(text("SELECT 1"))
+            # Required before any table with a pgvector Vector column
+            # (document_chunks.embedding) can be created. Idempotent — safe
+            # to run on every startup.
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             await conn.run_sync(Base.metadata.create_all)
 
         logger.info("Database connection and schema initialized successfully.")
@@ -104,5 +108,3 @@ async def close_db() -> None:
     await engine.dispose()
 
     logger.info("Database connections closed.")
-
-

@@ -6,8 +6,8 @@ lifecycle of user-uploaded financial documents (PDF only, at present):
     1. Accepting raw uploaded PDF bytes.
     2. Extracting plain text from the PDF.
     3. Splitting the extracted text into overlapping semantic chunks.
-    4. Generating vector embeddings for each chunk via the Gemini embedding
-       model.
+    4. Generating vector embeddings for each chunk via a local
+       ``sentence-transformers`` model (no external API call).
     5. Persisting document metadata and chunk embeddings via SQLAlchemy 2.0
        async ORM models.
     6. Retrieving the most relevant chunks for a given user query using
@@ -37,21 +37,46 @@ import io
 import logging
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Final
 
-from google import genai
 from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.database.models import Document, DocumentChunk
+from app.database.models import EMBEDDING_DIM, Document, DocumentChunk
 
 logger: Final[logging.Logger] = logging.getLogger(__name__)
 
 # Sentence/paragraph boundary separators used by the recursive splitter,
 # ordered from "most preferred split point" to "least preferred".
 _SPLIT_SEPARATORS: Final[tuple[str, ...]] = ("\n\n", "\n", ". ", " ", "")
+
+# Local sentence-transformers model used for both document chunk and query
+# embeddings. Produces 768-dimensional vectors natively, matching the
+# existing Vector(EMBEDDING_DIM) column -- no output-dimension truncation
+# or remote API batching/rate-limit handling is needed here.
+_EMBEDDING_MODEL_NAME: Final[str] = "BAAI/bge-base-en-v1.5"
+
+
+@lru_cache(maxsize=1)
+def _get_embedding_model() -> SentenceTransformer:
+    """Load (once per process) and return the local embedding model.
+
+    Constructing ``SentenceTransformer`` loads model weights into memory
+    (downloading them from Hugging Face Hub on first use, cached locally
+    afterward) -- expensive enough that it must not happen per request.
+    Cached here at module scope so every ``DocumentService`` instance
+    (itself created per request/unit-of-work) shares one loaded model
+    instead of reloading it each time.
+
+    Returns:
+        The loaded ``SentenceTransformer`` instance for
+        ``_EMBEDDING_MODEL_NAME``.
+    """
+    return SentenceTransformer(_EMBEDDING_MODEL_NAME)
 
 
 class DocumentIngestionError(Exception):
@@ -68,9 +93,11 @@ class DocumentService:
     contracts, etc.).
 
     Instances are cheap to construct and hold no long-lived state beyond
-    the injected database session and a lazily-created Gemini client, so a
-    new instance should be created per request/unit-of-work, matching the
-    lifecycle of the injected :class:`AsyncSession`.
+    the injected database session -- the local embedding model is loaded
+    once per process (see ``_get_embedding_model``) and shared across all
+    instances, so a new ``DocumentService`` should still be created per
+    request/unit-of-work, matching the lifecycle of the injected
+    :class:`AsyncSession`.
     """
 
     def __init__(self, session: AsyncSession) -> None:
@@ -85,9 +112,6 @@ class DocumentService:
         """
         self._session = session
         self._settings = get_settings()
-        self._genai_client = genai.Client(
-            api_key=self._settings.gemini_api_key.get_secret_value()
-        )
 
     # ------------------------------------------------------------------
     # Ingestion
@@ -96,7 +120,7 @@ class DocumentService:
     async def ingest_document(
         self,
         *,
-        user_id: int,
+        user_id: uuid.UUID,
         filename: str,
         file_content: bytes,
         content_type: str = "application/pdf",
@@ -108,7 +132,11 @@ class DocumentService:
         of work.
 
         Args:
-            user_id: Identifier of the user who owns this document.
+            user_id: Internal ``User.id`` (UUID) of the user who owns this
+                document. This is NOT the Telegram numeric id — callers must
+                resolve the Telegram id to the internal User row first (e.g.
+                via ``MemoryService.get_user_by_telegram_id``), since
+                ``Document.user_id`` is a UUID foreign key to ``users.id``.
             filename: Original filename as uploaded by the user.
             file_content: Raw bytes of the uploaded PDF file.
             content_type: MIME type of the uploaded file. Defaults to
@@ -379,17 +407,24 @@ class DocumentService:
             to ``settings.EMBEDDING_DIMENSION``.
 
         Raises:
-            DocumentIngestionError: If the Gemini embedding API call fails.
+            DocumentIngestionError: If the local embedding model call fails.
         """
         embeddings = await self._generate_embeddings_batch([text])
         return embeddings[0]
 
     async def _generate_embeddings_batch(self, texts: list[str]) -> list[list[float]]:
-        """Generate embeddings for a batch of texts via the Gemini API.
+        """Generate embeddings for a batch of texts using the local model.
 
-        The underlying ``google-genai`` client is synchronous, so the call
-        is offloaded to a worker thread via :func:`asyncio.to_thread` to
-        avoid blocking the event loop.
+        ``SentenceTransformer.encode`` is synchronous and CPU/GPU-bound, so
+        the call is offloaded to a worker thread via
+        :func:`asyncio.to_thread` to avoid blocking the event loop. The
+        model handles internal batching efficiently on its own, so the full
+        list of texts is passed in a single call -- there is no per-request
+        item cap to work around here (that was specific to the Gemini API
+        this service previously used).
+
+        Embeddings are L2-normalized (``normalize_embeddings=True``), per
+        the model's own recommended usage for cosine-similarity retrieval.
 
         Args:
             texts: List of text chunks to embed, in order.
@@ -399,30 +434,31 @@ class DocumentService:
             order as ``texts``.
 
         Raises:
-            DocumentIngestionError: If the embedding API call fails or
-                returns a mismatched number of embeddings.
+            DocumentIngestionError: If the embedding model call fails, or
+                the number of embeddings returned doesn't match the number
+                of texts sent.
         """
+        if not texts:
+            return []
+
         try:
-            response = await asyncio.to_thread(
-                self._genai_client.models.embed_content,
-                model=self._settings.embedding_model,
-                contents=texts,
+            model = _get_embedding_model()
+            raw_embeddings = await asyncio.to_thread(
+                model.encode,
+                texts,
+                normalize_embeddings=True,
             )
         except Exception as exc:  # noqa: BLE001 - normalize to domain error
             raise DocumentIngestionError(
-                f"Gemini embedding request failed: {exc}"
+                f"Local embedding model request failed: {exc}"
             ) from exc
 
-        raw_embeddings = response.embeddings or []
-        embeddings = [
-            list(embedding.values) if embedding.values is not None else []
-            for embedding in raw_embeddings
-        ]
+        embeddings = [list(map(float, vector)) for vector in raw_embeddings]
 
         if len(embeddings) != len(texts):
             raise DocumentIngestionError(
-                f"Expected {len(texts)} embeddings from Gemini, got "
-                f"{len(embeddings)}."
+                f"Expected {len(texts)} embeddings from the local embedding "
+                f"model, got {len(embeddings)}."
             )
 
         return embeddings
@@ -434,9 +470,9 @@ class DocumentService:
     async def retrieve_relevant_chunks(
         self,
         *,
-        user_id: int,
+        user_id: uuid.UUID,
         query: str,
-        top_k: int = 5,
+        top_k: int | None = None,
     ) -> list[DocumentChunk]:
         """Retrieve the most relevant document chunks for a user query.
 
@@ -445,12 +481,13 @@ class DocumentService:
         restricted to documents owned by ``user_id``.
 
         Args:
-            user_id: Identifier of the user whose documents should be
-                searched. Ensures users can never retrieve another user's
-                document chunks.
+            user_id: Internal ``User.id`` (UUID) of the user whose documents
+                should be searched. Ensures users can never retrieve another
+                user's document chunks.
             query: Natural-language query to search for.
-            top_k: Maximum number of chunks to return, ordered from most
-                to least relevant.
+            top_k: Maximum number of chunks to return, ordered from most to
+                least relevant. Defaults to ``settings.rag_top_k`` when not
+                explicitly provided.
 
         Returns:
             A list of the most relevant :class:`DocumentChunk` instances,
@@ -464,6 +501,8 @@ class DocumentService:
         if not query.strip():
             return []
 
+        effective_top_k = top_k if top_k is not None else self._settings.rag_top_k
+
         query_embedding = await self._generate_embedding(query)
 
         statement = (
@@ -471,7 +510,7 @@ class DocumentService:
             .join(Document, DocumentChunk.document_id == Document.id)
             .where(Document.user_id == user_id)
             .order_by(DocumentChunk.embedding.cosine_distance(query_embedding))
-            .limit(top_k)
+            .limit(effective_top_k)
         )
         result = await self._session.execute(statement)
         return list(result.scalars().all())
@@ -479,9 +518,9 @@ class DocumentService:
     async def get_context_for_query(
         self,
         *,
-        user_id: int,
+        user_id: uuid.UUID,
         query: str,
-        top_k: int = 5,
+        top_k: int | None = None,
     ) -> str:
         """Build a clean, LLM-ready context string for a user query.
 
@@ -491,10 +530,12 @@ class DocumentService:
         can (optionally) reference which document a fact came from.
 
         Args:
-            user_id: Identifier of the user whose documents should be
-                searched.
+            user_id: Internal ``User.id`` (UUID) of the user whose documents
+                should be searched.
             query: Natural-language query to build context for.
             top_k: Maximum number of chunks to include in the context.
+                Defaults to ``settings.rag_top_k`` when not explicitly
+                provided.
 
         Returns:
             A newline-separated context string. Returns an empty string if

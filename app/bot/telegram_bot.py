@@ -176,7 +176,7 @@ async def handle_document_upload(message: Message) -> None:
         async with AsyncSessionLocal() as session:
             doc_service = DocumentService(session)
             ingested_doc = await doc_service.ingest_document(
-                user_id=user.telegram_id,
+                user_id=user.id,
                 filename=filename,
                 file_content=file_bytes,
                 content_type="application/pdf",
